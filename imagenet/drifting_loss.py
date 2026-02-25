@@ -408,6 +408,7 @@ def drifting_loss_for_feature_set(
     sinkhorn_marginal: SinkhornMarginal = "none",
     mask_self_neg: bool = True,
     dist_metric: DistMetric = "l2",
+    normalize_drift_theta: bool = True,
     stats: dict[str, float] | None = None,
 ) -> torch.Tensor:
     """
@@ -438,6 +439,7 @@ def drifting_loss_for_feature_set(
       sinkhorn_marginal: how to handle CFG(w) for Sinkhorn; prefer "weighted_cols".
       mask_self_neg: mask diagonal self-coupling inside generated negatives (Alg. 2).
       dist_metric: pairwise distance metric ("l2" for ||x-y||, "l2_sq" for ||x-y||^2).
+      normalize_drift_theta: if True, apply Eq. (25) drift normalization V/theta.
       stats: optional dict populated with lightweight debug scalars for logging.
     """
     # Important: this loss involves cdist/logsumexp/Sinkhorn-like scaling and is
@@ -691,7 +693,10 @@ def drifting_loss_for_feature_set(
                 if stats is not None:
                     tag = str(rho).replace(".", "p")
                     stats[f"drift_theta_{tag}"] = float(theta)
-                v_agg = v_agg + (v_raw / theta)
+                if normalize_drift_theta:
+                    v_agg = v_agg + (v_raw / theta)
+                else:
+                    v_agg = v_agg + v_raw
 
             v_agg_nlc = v_agg.permute(1, 0, 2).contiguous()  # [Nneg,L,C]
 

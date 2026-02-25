@@ -8,7 +8,8 @@ Kaiming's paper alignment
 - Appendix A.2:
   generator architecture ('imagenet.models.dit_b2.DiTLatentB2').
 - Appendix A.3:
-  MAE encoder checkpoint loaded by '--mae-ckpt' as drifting feature extractor.
+  MAE encoder checkpoint loaded by '--mae-ckpt' as drifting feature extractor
+  (or MoCo-v2 via '--feature-encoder moco --moco-ckpt').
 - Appendix A.5/A.6:
   feature sets, drift construction, and normalized loss in 'imagenet.drifting_loss'.
 - Appendix A.7:
@@ -40,13 +41,15 @@ from datetime import datetime
 from pathlib import Path
 from contextlib import nullcontext
 from dataclasses import asdict
-from typing import Iterable, Literal
+from typing import Iterable, Literal, Sequence
 
 import numpy as np
 import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 from tqdm import tqdm
+from torchvision import transforms
 
+from imagenet.data.imagenet_folders import build_imagenet_dataset
 from imagenet.data.latents_memmap import final_paths
 from imagenet.drifting_loss import (
     drifting_loss_for_feature_set,
@@ -57,10 +60,12 @@ from imagenet.drifting_loss import (
 )
 from imagenet.models.dit_b2 import DiTB2Config, DiTLatentB2
 from imagenet.models.ema import EMA
+from imagenet.models.moco_resnet import load_moco_resnet_encoder
 from imagenet.models.resnet_mae import ResNetMAE, ResNetMAEConfig
 from imagenet.utils.dist import all_reduce_mean, barrier, broadcast_object, init_distributed, is_main_process
 from imagenet.utils.misc import seed_all
 from imagenet.utils.runs import RunPaths, create_run_dir
+from imagenet.vae_sd import VaeConfig, load_vae
 
 
 def _parse_floats(csv: str) -> list[float]:
@@ -73,13 +78,204 @@ def _parse_floats(csv: str) -> list[float]:
     return out
 
 
+def _parse_rgb_triplet(csv: str, *, name: str) -> tuple[float, float, float]:
+    vals = _parse_floats(csv)
+    if len(vals) != 3:
+        raise ValueError(f"{name} must have exactly 3 comma-separated values, got: {csv!r}")
+    return float(vals[0]), float(vals[1]), float(vals[2])
+
+
+def _build_moco_real_transform(
+    *,
+    resize_size: int,
+    crop_size: int,
+    mean: Sequence[float],
+    std: Sequence[float],
+):
+    return transforms.Compose(
+        [
+            transforms.Resize(int(resize_size), interpolation=transforms.InterpolationMode.BICUBIC),
+            transforms.CenterCrop(int(crop_size)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=list(mean), std=list(std)),
+        ]
+    )
+
+
+def _fetch_rgb_batch_by_indices(dataset, indices: np.ndarray, *, device: torch.device) -> torch.Tensor:
+    if int(indices.shape[0]) == 0:
+        return torch.empty((0, 3, 0, 0), device=device, dtype=torch.float32)
+    imgs = []
+    for ii in indices.tolist():
+        img, _, _ = dataset[int(ii)]
+        if not torch.is_tensor(img):
+            raise TypeError(f"Image dataset must return tensors after transform, got: {type(img)}")
+        imgs.append(img)
+    return torch.stack(imgs, dim=0).to(device=device, dtype=torch.float32, non_blocking=True)
+
+
+def _center_crop_bchw(x: torch.Tensor, crop_size: int) -> torch.Tensor:
+    if x.ndim != 4:
+        raise ValueError(f"Expected [B,C,H,W], got {tuple(x.shape)}")
+    h, w = int(x.shape[-2]), int(x.shape[-1])
+    c = int(crop_size)
+    if c <= 0:
+        raise ValueError(f"crop_size must be > 0, got {c}")
+    if c > h or c > w:
+        raise ValueError(f"crop_size={c} exceeds image size ({h},{w})")
+    top = (h - c) // 2
+    left = (w - c) // 2
+    return x[..., top : top + c, left : left + c]
+
+
+def _decode_latents_to_moco_input(
+    *,
+    vae,
+    latents: torch.Tensor,
+    scaling_factor: float,
+    resize_size: int,
+    crop_size: int,
+    mean_t: torch.Tensor,
+    std_t: torch.Tensor,
+    clamp_rgb: bool,
+) -> torch.Tensor:
+    vae_param = next(vae.parameters())
+    lat_in = (latents / float(scaling_factor)).to(device=vae_param.device, dtype=vae_param.dtype)
+    dec = vae.decode(lat_in)
+    imgs = dec.sample.to(dtype=torch.float32)
+    if not torch.isfinite(imgs).all():
+        raise FloatingPointError("Non-finite values produced by SD-VAE decode.")
+    imgs = 0.5 * (imgs + 1.0)
+    if bool(clamp_rgb):
+        imgs = imgs.clamp(0.0, 1.0)
+    if int(resize_size) > 0 and (int(imgs.shape[-2]) != int(resize_size) or int(imgs.shape[-1]) != int(resize_size)):
+        imgs = torch.nn.functional.interpolate(
+            imgs,
+            size=(int(resize_size), int(resize_size)),
+            mode="bilinear",
+            align_corners=False,
+            antialias=True,
+        )
+    if int(crop_size) > 0 and (int(imgs.shape[-2]) != int(crop_size) or int(imgs.shape[-1]) != int(crop_size)):
+        imgs = _center_crop_bchw(imgs, int(crop_size))
+    return (imgs - mean_t) / std_t
+
+
+def _feature_sets_from_maps(maps: list[torch.Tensor]) -> list:
+    sets = []
+    for mi, fmap in enumerate(maps):
+        sets.extend(feature_sets_from_feature_map(fmap, prefix=f"enc{mi:02d}"))
+    return sets
+
+
+def _isfinite_tensor(x: torch.Tensor) -> bool:
+    return bool(torch.isfinite(x).all().item())
+
+
+def _tensor_summary(name: str, x: torch.Tensor) -> str:
+    xd = x.detach()
+    finite = torch.isfinite(xd)
+    n = int(xd.numel())
+    nf = int(finite.sum().item())
+    if n == 0:
+        return f"{name}:shape={tuple(xd.shape)} dtype={xd.dtype} empty"
+    if nf == 0:
+        return f"{name}:shape={tuple(xd.shape)} dtype={xd.dtype} finite=0/{n}"
+    xf = xd[finite].float()
+    min_v = float(xf.min().item())
+    max_v = float(xf.max().item())
+    mean_v = float(xf.mean().item())
+    std_v = float(xf.std(unbiased=False).item())
+    absmax_v = float(xf.abs().max().item())
+    return (
+        f"{name}:shape={tuple(xd.shape)} dtype={xd.dtype} finite={nf}/{n} "
+        f"min={min_v:.4e} max={max_v:.4e} mean={mean_v:.4e} std={std_v:.4e} absmax={absmax_v:.4e}"
+    )
+
+
+def _first_nonfinite_grad(module: torch.nn.Module) -> tuple[str, str] | None:
+    for name, p in module.named_parameters():
+        if p.grad is None:
+            continue
+        g = p.grad.detach()
+        if not torch.isfinite(g).all():
+            return name, _tensor_summary(f"grad[{name}]", g)
+    return None
+
+
+def _first_nonfinite_param(module: torch.nn.Module) -> tuple[str, str] | None:
+    for name, p in module.named_parameters():
+        v = p.detach()
+        if not torch.isfinite(v).all():
+            return name, _tensor_summary(f"param[{name}]", v)
+    return None
+
+
+def _tf32_effective(device: torch.device) -> bool:
+    if device.type != "cuda":
+        return False
+    try:
+        return bool(torch.backends.cuda.matmul.allow_tf32 and torch.backends.cudnn.allow_tf32)
+    except Exception:
+        return False
+
+
+def _precision_log_fields(
+    *,
+    feature_encoder_mode: str,
+    args: argparse.Namespace,
+    use_amp: bool,
+    use_amp_gen: bool,
+    use_scaler: bool,
+    scaler,
+    device: torch.device,
+) -> dict[str, object]:
+    amp_requested = bool(args.amp)
+    amp_active = bool(use_amp)
+    amp_dtype_requested = str(args.amp_dtype)
+    gen_forward_dtype = (amp_dtype_requested if bool(use_amp_gen) else "fp32")
+
+    if feature_encoder_mode == "moco":
+        feature_forward_dtype = ("fp32" if bool(args.moco_force_fp32) else (amp_dtype_requested if amp_active else "fp32"))
+        vae_decode_dtype = str(args.vae_dtype)
+    else:
+        feature_forward_dtype = gen_forward_dtype
+        vae_decode_dtype = None
+
+    scaler_enabled = bool(scaler is not None and use_scaler)
+    scaler_scale = (float(scaler.get_scale()) if scaler_enabled else 1.0)
+
+    precision_mode = (
+        f"amp_{amp_dtype_requested}" if bool(use_amp_gen) else "fp32_gen"
+    )
+    if feature_encoder_mode == "moco":
+        precision_mode = f"{precision_mode}+moco_feat_{feature_forward_dtype}+vae_{vae_decode_dtype}"
+
+    return {
+        "log_schema_version": 2,
+        "precision_mode": precision_mode,
+        "amp_requested": amp_requested,
+        "amp_active": amp_active,
+        "amp_dtype_requested": amp_dtype_requested,
+        "gen_autocast_enabled": bool(use_amp_gen),
+        "gen_forward_dtype": gen_forward_dtype,
+        "feature_forward_dtype": feature_forward_dtype,
+        "vae_decode_dtype": vae_decode_dtype,
+        "grad_scaler_enabled": scaler_enabled,
+        "grad_scaler_scale": scaler_scale,
+        "tf32_override": ("default" if args.tf32 is None else bool(args.tf32)),
+        "tf32_effective": _tf32_effective(device),
+    }
+
+
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Train drifting generator on ImageNet256 latents (paper §5.2).")
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument("--seed", type=int, default=0)
 
-    # Data (pre-encoded SD-VAE latents)
+    # Data
     p.add_argument("--latents-dir", type=str, default="data/imagenet256_latents")
+    p.add_argument("--imagenet-root", type=str, default="", help="Required when --feature-encoder=moco.")
     p.add_argument("--split", type=str, default="train", choices=["train", "val"])
     p.add_argument("--num-classes", type=int, default=1000)
     p.add_argument("--max-items", type=int, default=0, help="Debug: use only first N items (0=all).")
@@ -93,10 +289,38 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--queue-global-size", type=int, default=1000, help="Global unconditional queue size (Appendix A.8).")
     p.add_argument("--queue-push", type=int, default=64, help="Number of new real samples pushed per step (Appendix A.8).")
 
-    # Feature encoder (latent-MAE)
-    p.add_argument("--mae-ckpt", type=str, required=True)
+    # Feature encoder
+    p.add_argument("--feature-encoder", type=str, choices=["mae", "moco"], default="mae")
+    p.add_argument("--mae-ckpt", type=str, default="")
     p.add_argument("--mae-use-ema", action="store_true", help="Use EMA weights from MAE checkpoint.")
     p.add_argument("--mae-every-n-blocks", type=int, default=2)
+    p.add_argument("--moco-ckpt", type=str, default="")
+    p.add_argument("--moco-arch", type=str, default="resnet50", choices=["resnet50"])
+    p.add_argument("--moco-input-size", type=int, default=256, help="Resize short side for MoCo input.")
+    p.add_argument("--moco-center-crop", type=int, default=224, help="Center crop size for MoCo input.")
+    p.add_argument("--moco-mean", type=str, default="0.485,0.456,0.406")
+    p.add_argument("--moco-std", type=str, default="0.229,0.224,0.225")
+    p.add_argument(
+        "--moco-clamp-rgb",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Clamp decoded RGB to [0,1] before ImageNet normalization.",
+    )
+    p.add_argument("--vae-id", type=str, default="stabilityai/sd-vae-ft-ema")
+    p.add_argument("--vae-scale", type=float, default=0.18215)
+    p.add_argument("--vae-dtype", type=str, choices=["fp16", "fp32"], default="fp32")
+    p.add_argument(
+        "--moco-force-fp32",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Run MoCo feature extraction in float32 for numerical stability.",
+    )
+    p.add_argument(
+        "--moco-gen-fp32",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Run generator forward in float32 in MoCo mode to reduce fp16 gradient overflow risk.",
+    )
 
     # Generator (DiT-B/2; Table 8)
     p.add_argument("--hidden-dim", type=int, default=768)
@@ -163,6 +387,12 @@ def _parse_args() -> argparse.Namespace:
         default="l2",
         help="Pairwise distance metric for drift construction: l2 uses ||x-y|| (baseline), l2_sq uses ||x-y||^2.",
     )
+    p.add_argument(
+        "--drift-theta-norm",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Apply per-temperature drift theta normalization (Eq. 25). Disable only for diagnostics.",
+    )
 
     # CFG omega sampling (Table 8)
     p.add_argument("--omega-min", type=float, default=1.0)
@@ -202,14 +432,26 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         "--log-drift-stats",
         action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Log lightweight drift normalization stats (S_j, theta, and optional Sinkhorn marginal error) for one feature set.",
+        default=True,
+        help="Log lightweight drift normalization stats (S_j, theta, and optional Sinkhorn marginal error) for one feature set (default: enabled).",
     )
     p.add_argument(
         "--drift-stats-name",
         type=str,
         default="vanilla.latent",
         help="FeatureSet name to attach drift stats to when --log-drift-stats is enabled.",
+    )
+    p.add_argument(
+        "--overfit-one-batch",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Debug sanity check: sample one training batch once and reuse it every step to force overfitting.",
+    )
+    p.add_argument(
+        "--fail-on-nan",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Fail fast when non-finite activations/loss are detected.",
     )
     p.add_argument("--debug", action="store_true")
     return p.parse_args()
@@ -463,6 +705,30 @@ def main() -> None:
         args.log_every = 1
         args.save_every = 0
 
+    feature_encoder_mode = str(args.feature_encoder)
+    moco_mean = _parse_rgb_triplet(args.moco_mean, name="--moco-mean")
+    moco_std = _parse_rgb_triplet(args.moco_std, name="--moco-std")
+    if any(float(s) <= 0 for s in moco_std):
+        raise ValueError(f"--moco-std must be strictly positive, got {moco_std}")
+    if feature_encoder_mode == "mae":
+        if not str(args.mae_ckpt).strip():
+            raise ValueError("--mae-ckpt is required when --feature-encoder=mae")
+    elif feature_encoder_mode == "moco":
+        if not str(args.moco_ckpt).strip():
+            raise ValueError("--moco-ckpt is required when --feature-encoder=moco")
+        if not str(args.imagenet_root).strip():
+            raise ValueError("--imagenet-root is required when --feature-encoder=moco")
+        if not bool(args.fail_on_nan):
+            raise ValueError("--feature-encoder=moco requires --fail-on-nan (cannot disable).")
+        if int(args.moco_input_size) <= 0 or int(args.moco_center_crop) <= 0:
+            raise ValueError("--moco-input-size and --moco-center-crop must be > 0")
+        if int(args.moco_input_size) < int(args.moco_center_crop):
+            raise ValueError("--moco-input-size must be >= --moco-center-crop")
+        if str(args.drift_stats_name) == "vanilla.latent":
+            args.drift_stats_name = "enc00.loc"
+    else:
+        raise ValueError(f"Unknown --feature-encoder={feature_encoder_mode}")
+
     # Early validation (keep defaults paper-equivalent).
     if int(args.nuncond) > 0 and int(args.nneg) <= 1:
         raise ValueError("--nneg must be > 1 when --nuncond > 0 (CFG)")
@@ -497,16 +763,20 @@ def main() -> None:
             "drift_cfg="
             + json.dumps(
                 {
+                    "feature_encoder": feature_encoder_mode,
                     "drift_form": str(args.drift_form),
                     "coupling": str(args.coupling),
                     "alg2_impl": str(args.alg2_impl),
                     "mask_self_neg": bool(args.mask_self_neg),
                     "dist_metric": str(args.dist_metric),
+                    "drift_theta_norm": bool(args.drift_theta_norm),
                     "sinkhorn_iters": int(args.sinkhorn_iters),
                     "sinkhorn_marginal": str(args.sinkhorn_marginal),
                     "temps": str(args.temps),
                     "amp": bool(args.amp),
                     "amp_dtype": str(args.amp_dtype),
+                    "moco_force_fp32": bool(args.moco_force_fp32),
+                    "moco_gen_fp32": bool(args.moco_gen_fp32),
                     "tf32": (None if args.tf32 is None else bool(args.tf32)),
                 },
                 sort_keys=True,
@@ -528,15 +798,30 @@ def main() -> None:
     if not temps:
         raise ValueError("--temps must be non-empty")
 
-    # Load latents + labels.
-    lat_mm, lab_mm = _load_latents(args.latents_dir, args.split)
-    n_data = int(lab_mm.shape[0])
-    if args.max_items and args.max_items > 0:
-        n_data = min(n_data, int(args.max_items))
-        lat_mm = lat_mm[:n_data]
-        lab_mm = lab_mm[:n_data]
+    # Load training source and labels.
+    lat_mm = None
+    image_ds = None
+    if feature_encoder_mode == "mae":
+        lat_mm, lab_mm = _load_latents(args.latents_dir, args.split)
+        n_data = int(lab_mm.shape[0])
+        if args.max_items and args.max_items > 0:
+            n_data = min(n_data, int(args.max_items))
+            lat_mm = lat_mm[:n_data]
+            lab_mm = lab_mm[:n_data]
+        labels_np = np.asarray(lab_mm, dtype=np.int64)
+    else:
+        real_transform = _build_moco_real_transform(
+            resize_size=int(args.moco_input_size),
+            crop_size=int(args.moco_center_crop),
+            mean=moco_mean,
+            std=moco_std,
+        )
+        image_ds, _ = build_imagenet_dataset(args.imagenet_root, args.split, transform=real_transform)
+        n_data = len(image_ds)
+        if args.max_items and args.max_items > 0:
+            n_data = min(n_data, int(args.max_items))
+        labels_np = np.asarray(image_ds.targets[:n_data], dtype=np.int64)
 
-    labels_np = np.asarray(lab_mm, dtype=np.int64)
     idx_by_class = _build_indices_by_class(labels_np, num_classes=int(args.num_classes))
     available_classes = [c for c in range(int(args.num_classes)) if idx_by_class[c].shape[0] >= int(args.npos)]
     if len(available_classes) < int(args.nc):
@@ -588,8 +873,44 @@ def main() -> None:
             elif queue is None and qstate is not None and is_main_process():
                 print("Warning: checkpoint contains sample queue state but --sample-queue is disabled.")
 
-    # Feature encoder (MAE encoder, frozen).
-    encoder, mae_meta = _load_mae_encoder(args.mae_ckpt, dist_info.device, use_ema=bool(args.mae_use_ema))
+    # Feature encoder (frozen) and optional SD-VAE decoder for MoCo mode.
+    vae = None
+    moco_mean_t = None
+    moco_std_t = None
+    if feature_encoder_mode == "mae":
+        encoder, encoder_meta = _load_mae_encoder(args.mae_ckpt, dist_info.device, use_ema=bool(args.mae_use_ema))
+        feature_meta = {"feature_encoder": "mae", **encoder_meta}
+    else:
+        encoder, moco_meta = load_moco_resnet_encoder(
+            args.moco_ckpt,
+            arch=str(args.moco_arch),
+            device=dist_info.device,
+        )
+        vae_cfg = VaeConfig(
+            vae_id=str(args.vae_id),
+            scaling_factor=float(args.vae_scale),
+            dtype=str(args.vae_dtype),
+            encode_mode="mean",
+        )
+        vae = load_vae(vae_cfg, dist_info.device)
+        moco_mean_t = torch.tensor(moco_mean, device=dist_info.device, dtype=torch.float32).view(1, 3, 1, 1)
+        moco_std_t = torch.tensor(moco_std, device=dist_info.device, dtype=torch.float32).view(1, 3, 1, 1)
+        feature_meta = {
+            "feature_encoder": "moco",
+            "moco_arch": str(moco_meta.arch),
+            "moco_ckpt_path": str(moco_meta.ckpt_path),
+            "moco_loaded_keys": int(moco_meta.loaded_keys),
+            "moco_input_size": int(args.moco_input_size),
+            "moco_center_crop": int(args.moco_center_crop),
+            "moco_clamp_rgb": bool(args.moco_clamp_rgb),
+            "moco_mean": list(moco_mean),
+            "moco_std": list(moco_std),
+            "vae_id": str(args.vae_id),
+            "vae_scale": float(args.vae_scale),
+            "vae_dtype": str(args.vae_dtype),
+            "moco_force_fp32": bool(args.moco_force_fp32),
+            "moco_gen_fp32": bool(args.moco_gen_fp32),
+        }
 
     # Generator.
     if resume_ckpt is not None and isinstance(resume_ckpt.get("dit_cfg"), dict):
@@ -624,7 +945,10 @@ def main() -> None:
 
     use_amp = bool(args.amp) and dist_info.device.type == "cuda"
     amp_dtype = torch.float16 if str(args.amp_dtype) == "fp16" else torch.bfloat16
+    use_amp_gen = use_amp and not (feature_encoder_mode == "moco" and bool(args.moco_gen_fp32))
     use_scaler = use_amp and amp_dtype == torch.float16
+    if feature_encoder_mode == "moco" and bool(args.moco_gen_fp32):
+        use_scaler = False
     if dist_info.device.type == "cuda":
         try:
             scaler = torch.amp.GradScaler("cuda", enabled=use_scaler)
@@ -667,7 +991,7 @@ def main() -> None:
             config={
                 "args": vars(args),
                 "dit_cfg": asdict(dit_cfg),
-                **mae_meta,
+                **feature_meta,
                 "nc_local": nc_local,
                 "n_data": n_data,
             },
@@ -677,6 +1001,8 @@ def main() -> None:
     if is_main_process():
         print(f"Run dir: {run.run_dir}")
         print(f"DDP={dist_info.distributed} world={dist_info.world_size} nc_local={nc_local}")
+        if feature_encoder_mode == "moco" and bool(args.moco_gen_fp32) and bool(args.amp):
+            print("MoCo mode stability: generator autocast disabled (--moco-gen-fp32).")
         if args.resume:
             print(f"Resuming from: {args.resume} (start_step={start_step} -> steps={args.steps})")
 
@@ -687,6 +1013,12 @@ def main() -> None:
         return
 
     ddp_gen.train(True)
+    overfit_one_batch = bool(args.overfit_one_batch)
+    fixed_cls: np.ndarray | None = None
+    fixed_omega_t: torch.Tensor | None = None
+    fixed_microbatch: dict[int, dict[str, object]] = {}
+    if overfit_one_batch and is_main_process():
+        print("Overfit mode: reusing one sampled batch (cls/omega/z/pos/uncond) for every step.")
 
     pbar = tqdm(
         range(start_step, int(args.steps)),
@@ -704,43 +1036,50 @@ def main() -> None:
         opt.zero_grad(set_to_none=True)
 
         # Update sample queue with new real samples (Appendix A.8).
-        if queue is not None:
+        if queue is not None and not overfit_one_batch:
             queue.push_latest(int(args.queue_push))
 
         # Sample class labels and CFG scales globally, then shard to each rank.
-        if dist_info.distributed:
-            if is_main_process():
-                cls_global = rng.choice(available_classes_arr, size=int(args.nc), replace=False).astype(np.int64).tolist()
-                omega_global = sample_power_law_omega(
-                    int(args.nc),
+        if overfit_one_batch and fixed_cls is not None and fixed_omega_t is not None:
+            cls = fixed_cls.copy()
+            omega_t = fixed_omega_t.clone()
+        else:
+            if dist_info.distributed:
+                if is_main_process():
+                    cls_global = rng.choice(available_classes_arr, size=int(args.nc), replace=False).astype(np.int64).tolist()
+                    omega_global = sample_power_law_omega(
+                        int(args.nc),
+                        omega_min=float(args.omega_min),
+                        omega_max=float(args.omega_max),
+                        exponent=float(args.omega_exp),
+                        device=dist_info.device,
+                        dtype=torch.float32,
+                    ).detach().cpu().tolist()
+                else:
+                    cls_global = None
+                    omega_global = None
+                cls_global = broadcast_object(cls_global, src=0)
+                omega_global = broadcast_object(omega_global, src=0)
+
+                cls_all = np.asarray(cls_global, dtype=np.int64)
+                omega_all = torch.tensor(omega_global, device=dist_info.device, dtype=torch.float32)
+                c0 = dist_info.rank * nc_local
+                c1 = c0 + nc_local
+                cls = cls_all[c0:c1]
+                omega_t = omega_all[c0:c1]
+            else:
+                cls = rng.choice(available_classes_arr, size=nc_local, replace=False)
+                omega_t = sample_power_law_omega(
+                    nc_local,
                     omega_min=float(args.omega_min),
                     omega_max=float(args.omega_max),
                     exponent=float(args.omega_exp),
                     device=dist_info.device,
                     dtype=torch.float32,
-                ).detach().cpu().tolist()
-            else:
-                cls_global = None
-                omega_global = None
-            cls_global = broadcast_object(cls_global, src=0)
-            omega_global = broadcast_object(omega_global, src=0)
-
-            cls_all = np.asarray(cls_global, dtype=np.int64)
-            omega_all = torch.tensor(omega_global, device=dist_info.device, dtype=torch.float32)
-            c0 = dist_info.rank * nc_local
-            c1 = c0 + nc_local
-            cls = cls_all[c0:c1]
-            omega_t = omega_all[c0:c1]
-        else:
-            cls = rng.choice(available_classes_arr, size=nc_local, replace=False)
-            omega_t = sample_power_law_omega(
-                nc_local,
-                omega_min=float(args.omega_min),
-                omega_max=float(args.omega_max),
-                exponent=float(args.omega_exp),
-                device=dist_info.device,
-                dtype=torch.float32,
-            )
+                )
+            if overfit_one_batch:
+                fixed_cls = np.asarray(cls, dtype=np.int64).copy()
+                fixed_omega_t = omega_t.detach().clone()
 
         do_log = is_main_process() and (step % int(args.log_every) == 0 or step == int(args.steps) - 1)
         collect_drift_stats = bool(args.log_drift_stats) and do_log
@@ -750,6 +1089,7 @@ def main() -> None:
 
         loss_accum = 0.0
         nan_count = 0
+        feature_set_count_step: int | None = None
         # Microbatch over classes to keep memory bounded (paper §3.5: "perform Alg. 1 independently").
         for i in range(nc_local):
             c = int(cls[i])
@@ -758,26 +1098,55 @@ def main() -> None:
                 drift_stats["drift_class"] = float(c)
                 drift_stats["drift_omega"] = float(omega_c.detach().float().cpu().item())
 
-            # Noise -> generated latents
-            z = torch.randn(int(args.nneg), 4, 32, 32, device=dist_info.device)
+            if overfit_one_batch and i in fixed_microbatch:
+                cached = fixed_microbatch[i]
+                z = cached["z"].to(dist_info.device, non_blocking=True)  # type: ignore[union-attr]
+                pos_idx = np.asarray(cached["pos_idx"], dtype=np.int64)
+                uncond_idx = np.asarray(cached["uncond_idx"], dtype=np.int64)
+            else:
+                # Noise -> generated latents
+                z = torch.randn(int(args.nneg), 4, 32, 32, device=dist_info.device)
+
+                # Positives + unconditionals (real samples)
+                if queue is not None:
+                    pos_idx = queue.sample_pos(c, int(args.npos))
+                    uncond_idx = queue.sample_uncond(int(args.nuncond))
+                else:
+                    pos_pool = idx_by_class[c]
+                    pos_idx = rng.choice(pos_pool, size=int(args.npos), replace=(pos_pool.shape[0] < int(args.npos)))
+                    uncond_idx = (
+                        rng.choice(n_data, size=int(args.nuncond), replace=(n_data < int(args.nuncond)))
+                        if args.nuncond > 0
+                        else np.empty((0,), dtype=np.int64)
+                    )
+
+                if overfit_one_batch:
+                    fixed_microbatch[i] = {
+                        "z": z.detach().cpu(),
+                        "pos_idx": np.asarray(pos_idx, dtype=np.int64).copy(),
+                        "uncond_idx": np.asarray(uncond_idx, dtype=np.int64).copy(),
+                    }
+
             c_lab = torch.full((int(args.nneg),), c, device=dist_info.device, dtype=torch.long)
             omega_rep = omega_c.expand(int(args.nneg))
-
-            # Positives + unconditionals (real latents)
-            if queue is not None:
-                pos_idx = queue.sample_pos(c, int(args.npos))
-                uncond_idx = queue.sample_uncond(int(args.nuncond))
-            else:
-                pos_pool = idx_by_class[c]
-                pos_idx = rng.choice(pos_pool, size=int(args.npos), replace=(pos_pool.shape[0] < int(args.npos)))
-                uncond_idx = (
-                    rng.choice(n_data, size=int(args.nuncond), replace=(n_data < int(args.nuncond)))
+            if feature_encoder_mode == "mae":
+                if lat_mm is None:
+                    raise RuntimeError("Latent memmap is not loaded for MAE feature mode.")
+                pos_lat = torch.from_numpy(lat_mm[pos_idx]).to(dist_info.device).float()
+                uncond_lat = (
+                    torch.from_numpy(lat_mm[uncond_idx]).to(dist_info.device).float()
                     if args.nuncond > 0
-                    else np.empty((0,), dtype=np.int64)
+                    else torch.empty((0, 4, 32, 32), device=dist_info.device)
                 )
-
-            pos_lat = torch.from_numpy(lat_mm[pos_idx]).to(dist_info.device).float()
-            uncond_lat = torch.from_numpy(lat_mm[uncond_idx]).to(dist_info.device).float() if args.nuncond > 0 else torch.empty((0, 4, 32, 32), device=dist_info.device)
+            else:
+                if image_ds is None:
+                    raise RuntimeError("ImageNet dataset is not loaded for MoCo feature mode.")
+                pos_rgb = _fetch_rgb_batch_by_indices(image_ds, pos_idx, device=dist_info.device)
+                uncond_rgb = (
+                    _fetch_rgb_batch_by_indices(image_ds, uncond_idx, device=dist_info.device)
+                    if args.nuncond > 0
+                    else pos_rgb[:0]
+                )
 
             sync_ctx = (
                 ddp_gen.no_sync()
@@ -785,88 +1154,213 @@ def main() -> None:
                 else nullcontext()
             )
             with sync_ctx:
-                amp_ctx = torch.autocast(device_type=dist_info.device.type, dtype=amp_dtype, enabled=use_amp)
-                with amp_ctx:
-                    x_lat = ddp_gen(z, c_lab, omega_rep)  # [Nneg,4,32,32]
+                amp_ctx = torch.autocast(device_type=dist_info.device.type, dtype=amp_dtype, enabled=use_amp_gen)
+                if feature_encoder_mode == "mae":
+                    with amp_ctx:
+                        x_lat = ddp_gen(z, c_lab, omega_rep)  # [Nneg,4,32,32]
 
-                    # Generated features WITH grad.
-                    maps_x = encoder.forward_feature_maps(x_lat, every_n_blocks=int(args.mae_every_n_blocks))
-                    x_sets = []
-                    for mi, fmap in enumerate(maps_x):
-                        x_sets.extend(feature_sets_from_feature_map(fmap, prefix=f"enc{mi:02d}"))
-                    x_sets.extend(feature_sets_from_encoder_input(x_lat))
-                    x_sets.append(flatten_latents_as_feature_set(x_lat))
+                        # Generated features WITH grad.
+                        maps_x = encoder.forward_feature_maps(x_lat, every_n_blocks=int(args.mae_every_n_blocks))
+                        x_sets = _feature_sets_from_maps(maps_x)
+                        x_sets.extend(feature_sets_from_encoder_input(x_lat))
+                        x_sets.append(flatten_latents_as_feature_set(x_lat))
 
-                    # Real features under no_grad (stop-grad in drift construction).
-                    with torch.no_grad():
-                        maps_pos = encoder.forward_feature_maps(pos_lat, every_n_blocks=int(args.mae_every_n_blocks))
-                        pos_sets = []
-                        for mi, fmap in enumerate(maps_pos):
-                            pos_sets.extend(feature_sets_from_feature_map(fmap, prefix=f"enc{mi:02d}"))
-                        pos_sets.extend(feature_sets_from_encoder_input(pos_lat))
-                        pos_sets.append(flatten_latents_as_feature_set(pos_lat))
+                        # Real features under no_grad (stop-grad in drift construction).
+                        with torch.no_grad():
+                            maps_pos = encoder.forward_feature_maps(pos_lat, every_n_blocks=int(args.mae_every_n_blocks))
+                            pos_sets = _feature_sets_from_maps(maps_pos)
+                            pos_sets.extend(feature_sets_from_encoder_input(pos_lat))
+                            pos_sets.append(flatten_latents_as_feature_set(pos_lat))
 
-                        if int(args.nuncond) > 0:
-                            maps_unc = encoder.forward_feature_maps(uncond_lat, every_n_blocks=int(args.mae_every_n_blocks))
-                            unc_sets = []
-                            for mi, fmap in enumerate(maps_unc):
-                                unc_sets.extend(feature_sets_from_feature_map(fmap, prefix=f"enc{mi:02d}"))
-                            unc_sets.extend(feature_sets_from_encoder_input(uncond_lat))
-                            unc_sets.append(flatten_latents_as_feature_set(uncond_lat))
-                        else:
-                            unc_sets = []
+                            if int(args.nuncond) > 0:
+                                maps_unc = encoder.forward_feature_maps(uncond_lat, every_n_blocks=int(args.mae_every_n_blocks))
+                                unc_sets = _feature_sets_from_maps(maps_unc)
+                                unc_sets.extend(feature_sets_from_encoder_input(uncond_lat))
+                                unc_sets.append(flatten_latents_as_feature_set(uncond_lat))
+                            else:
+                                unc_sets = []
+                else:
+                    with amp_ctx:
+                        x_lat = ddp_gen(z, c_lab, omega_rep)  # [Nneg,4,32,32]
 
-                    pos_dict = {fs.name: fs.x for fs in pos_sets}
-                    unc_dict = {fs.name: fs.x for fs in unc_sets}
-
-                    class_loss = torch.zeros((), device=dist_info.device, dtype=torch.float32)
-                    for fs in x_sets:
-                        y_pos = pos_dict[fs.name]
-                        y_unc = unc_dict.get(fs.name, _as_empty_like(y_pos))
-                        stats_arg = None
-                        if drift_stats is not None and (not drift_stats_done) and fs.name == drift_stats_name:
-                            stats_arg = drift_stats
-                            drift_stats_done = True
-                        class_loss = class_loss + drifting_loss_for_feature_set(
-                            fs.x,
-                            y_pos,
-                            y_unc,
-                            omega=omega_c,
-                            temps=temps,
-                            impl=str(args.alg2_impl),
-                            drift_form=str(args.drift_form),
-                            coupling=str(args.coupling),
-                            sinkhorn_iters=int(args.sinkhorn_iters),
-                            sinkhorn_marginal=str(args.sinkhorn_marginal),
-                            mask_self_neg=bool(args.mask_self_neg),
-                            dist_metric=str(args.dist_metric),
-                            stats=stats_arg,
+                    with torch.autocast(device_type=dist_info.device.type, enabled=False):
+                        if vae is None or moco_mean_t is None or moco_std_t is None:
+                            raise RuntimeError("MoCo mode requires loaded SD-VAE and normalization stats.")
+                        x_rgb = _decode_latents_to_moco_input(
+                            vae=vae,
+                            latents=x_lat,
+                            scaling_factor=float(args.vae_scale),
+                            resize_size=int(args.moco_input_size),
+                            crop_size=int(args.moco_center_crop),
+                            mean_t=moco_mean_t,
+                            std_t=moco_std_t,
+                            clamp_rgb=bool(args.moco_clamp_rgb),
                         )
+                        if bool(args.moco_force_fp32):
+                            x_rgb = x_rgb.float()
+                            pos_enc = pos_rgb.float()
+                            uncond_enc = uncond_rgb.float()
+                            moco_ctx = nullcontext()
+                        else:
+                            pos_enc = pos_rgb
+                            uncond_enc = uncond_rgb
+                            moco_ctx = torch.autocast(device_type=dist_info.device.type, dtype=amp_dtype, enabled=use_amp)
 
-                    # Normalize by number of classes on this rank to keep step loss stable.
-                    class_loss = class_loss / float(nc_local)
+                        if bool(args.fail_on_nan):
+                            if not _isfinite_tensor(x_rgb):
+                                raise FloatingPointError(
+                                    "Non-finite decoded RGB "
+                                    f"at step={step_done} class={c}. "
+                                    f"{_tensor_summary('x_lat', x_lat)}; {_tensor_summary('x_rgb', x_rgb)}"
+                                )
+                            if not _isfinite_tensor(pos_enc):
+                                raise FloatingPointError(
+                                    "Non-finite positive RGB "
+                                    f"at step={step_done} class={c}. {_tensor_summary('pos_rgb', pos_enc)}"
+                                )
+                            if int(args.nuncond) > 0 and not _isfinite_tensor(uncond_enc):
+                                raise FloatingPointError(
+                                    "Non-finite unconditional RGB "
+                                    f"at step={step_done} class={c}. {_tensor_summary('uncond_rgb', uncond_enc)}"
+                                )
+
+                        with moco_ctx:
+                            maps_x = encoder.forward_feature_maps(x_rgb, every_n_blocks=int(args.mae_every_n_blocks))
+                            x_sets = _feature_sets_from_maps(maps_x)
+                            x_sets.extend(feature_sets_from_encoder_input(x_rgb))
+
+                            with torch.no_grad():
+                                maps_pos = encoder.forward_feature_maps(pos_enc, every_n_blocks=int(args.mae_every_n_blocks))
+                                pos_sets = _feature_sets_from_maps(maps_pos)
+                                pos_sets.extend(feature_sets_from_encoder_input(pos_enc))
+
+                                if int(args.nuncond) > 0:
+                                    maps_unc = encoder.forward_feature_maps(uncond_enc, every_n_blocks=int(args.mae_every_n_blocks))
+                                    unc_sets = _feature_sets_from_maps(maps_unc)
+                                    unc_sets.extend(feature_sets_from_encoder_input(uncond_enc))
+                                else:
+                                    unc_sets = []
+
+                        if bool(args.fail_on_nan):
+                            for fs in x_sets:
+                                if not _isfinite_tensor(fs.x):
+                                    raise FloatingPointError(
+                                        "Non-finite generated feature set "
+                                        f"'{fs.name}' at step={step_done} class={c}. {_tensor_summary(fs.name, fs.x)}"
+                                    )
+                            for fs in pos_sets:
+                                if not _isfinite_tensor(fs.x):
+                                    raise FloatingPointError(
+                                        "Non-finite positive feature set "
+                                        f"'{fs.name}' at step={step_done} class={c}. {_tensor_summary(fs.name, fs.x)}"
+                                    )
+                            for fs in unc_sets:
+                                if not _isfinite_tensor(fs.x):
+                                    raise FloatingPointError(
+                                        "Non-finite unconditional feature set "
+                                        f"'{fs.name}' at step={step_done} class={c}. {_tensor_summary(fs.name, fs.x)}"
+                                    )
+
+                pos_dict = {fs.name: fs.x for fs in pos_sets}
+                unc_dict = {fs.name: fs.x for fs in unc_sets}
+                if feature_set_count_step is None:
+                    feature_set_count_step = len(x_sets)
+
+                class_loss = torch.zeros((), device=dist_info.device, dtype=torch.float32)
+                for fs in x_sets:
+                    y_pos = pos_dict[fs.name]
+                    y_unc = unc_dict.get(fs.name, _as_empty_like(y_pos))
+                    stats_arg = None
+                    if drift_stats is not None and (not drift_stats_done) and fs.name == drift_stats_name:
+                        stats_arg = drift_stats
+                        drift_stats_done = True
+                    class_loss = class_loss + drifting_loss_for_feature_set(
+                        fs.x,
+                        y_pos,
+                        y_unc,
+                        omega=omega_c,
+                        temps=temps,
+                        impl=str(args.alg2_impl),
+                        drift_form=str(args.drift_form),
+                        coupling=str(args.coupling),
+                        sinkhorn_iters=int(args.sinkhorn_iters),
+                        sinkhorn_marginal=str(args.sinkhorn_marginal),
+                        mask_self_neg=bool(args.mask_self_neg),
+                        dist_metric=str(args.dist_metric),
+                        normalize_drift_theta=bool(args.drift_theta_norm),
+                        stats=stats_arg,
+                    )
+
+                # Normalize by number of classes on this rank to keep step loss stable.
+                class_loss = class_loss / float(nc_local)
+                if bool(args.fail_on_nan) and not _isfinite_tensor(class_loss):
+                    raise FloatingPointError(
+                        "Non-finite class loss before backward "
+                        f"at step={step_done} class={c}. {_tensor_summary('class_loss', class_loss)}"
+                    )
 
                 if scaler is not None and use_scaler:
                     scaler.scale(class_loss).backward()
                 else:
                     class_loss.backward()
+                if bool(args.fail_on_nan):
+                    base_gen = ddp_gen.module if isinstance(ddp_gen, DDP) else ddp_gen
+                    bad_grad = _first_nonfinite_grad(base_gen)
+                    if bad_grad is not None:
+                        bad_name, bad_summary = bad_grad
+                        raise FloatingPointError(
+                            "Non-finite generator gradient after backward "
+                            f"at step={step_done} class={c} param={bad_name}. "
+                            f"{bad_summary}; {_tensor_summary('x_lat', x_lat)}"
+                        )
 
             class_loss_v = float(class_loss.detach().item())
             if not math.isfinite(class_loss_v):
                 nan_count += 1
+                if bool(args.fail_on_nan):
+                    raise FloatingPointError(
+                        "Non-finite class loss after backward "
+                        f"at step={step_done} class={c}. "
+                        f"{_tensor_summary('x_lat', x_lat)}; omega={float(omega_c.detach().float().cpu().item()):.4f}"
+                    )
             loss_accum += class_loss_v
 
         # Step optimizer.
         if args.grad_clip and args.grad_clip > 0:
+            if bool(args.fail_on_nan):
+                base_gen = ddp_gen.module if isinstance(ddp_gen, DDP) else ddp_gen
+                bad_grad = _first_nonfinite_grad(base_gen)
+                if bad_grad is not None:
+                    bad_name, bad_summary = bad_grad
+                    raise FloatingPointError(
+                        "Non-finite generator gradient before clipping "
+                        f"at step={step_done} param={bad_name}. {bad_summary}"
+                    )
             if scaler is not None and use_scaler:
                 scaler.unscale_(opt)
-            torch.nn.utils.clip_grad_norm_(ddp_gen.parameters(), max_norm=float(args.grad_clip))
+            try:
+                torch.nn.utils.clip_grad_norm_(
+                    ddp_gen.parameters(),
+                    max_norm=float(args.grad_clip),
+                    error_if_nonfinite=bool(args.fail_on_nan),
+                )
+            except TypeError:
+                torch.nn.utils.clip_grad_norm_(ddp_gen.parameters(), max_norm=float(args.grad_clip))
 
         if scaler is not None and use_scaler:
             scaler.step(opt)
             scaler.update()
         else:
             opt.step()
+        if bool(args.fail_on_nan):
+            base_gen = ddp_gen.module if isinstance(ddp_gen, DDP) else ddp_gen
+            bad_param = _first_nonfinite_param(base_gen)
+            if bad_param is not None:
+                bad_name, bad_summary = bad_param
+                raise FloatingPointError(
+                    "Non-finite generator parameter after optimizer step "
+                    f"at step={step_done} param={bad_name}. {bad_summary}"
+                )
         ema.update(gen)
 
         # Logging (reduce mean across ranks).
@@ -877,11 +1371,25 @@ def main() -> None:
         nan_mean = float(all_reduce_mean(nan_t).item())
         nan_global = int(round(nan_mean * float(dist_info.world_size)))
 
+        fset_local = float(feature_set_count_step if feature_set_count_step is not None else 0.0)
+        fset_t = torch.tensor(fset_local, device=dist_info.device, dtype=torch.float32)
+        fset_mean = float(all_reduce_mean(fset_t).item())
+        feature_set_count = int(round(fset_mean))
+        temps_count = int(len(temps))
+        loss_per_feature_set = (
+            float(loss_mean / float(feature_set_count)) if feature_set_count > 0 else float("nan")
+        )
+        loss_shape_norm = (
+            float(loss_per_feature_set / float(max(1, temps_count * temps_count)))
+            if math.isfinite(loss_per_feature_set)
+            else float("nan")
+        )
+
         if do_log:
             # For professor-facing logs we reserve "drift_norm" for an actual drift magnitude.
             # When enabled, 'drift_stats' records 'drift_v_rms' computed from Ṽ for one FeatureSet
-            # (default: 'vanilla.latent'). Otherwise we log NaN.
-            drift_norm = float("nan")
+            # (default: '--drift-stats-name'). Otherwise 'drift_norm' is null.
+            drift_norm = None
             if drift_stats is not None and "drift_v_rms" in drift_stats:
                 drift_norm = float(drift_stats["drift_v_rms"])
             rec = {
@@ -889,14 +1397,26 @@ def main() -> None:
                 "step_idx": step,
                 "lr": lr,
                 "loss": loss_mean,
+                "loss_per_feature_set": loss_per_feature_set,
+                "loss_shape_norm": loss_shape_norm,
                 "loss_isfinite": bool(math.isfinite(loss_mean)),
                 "drift_norm": drift_norm,
+                "drift_norm_available": bool(drift_norm is not None),
                 "nan_count": nan_global,
-                "amp": bool(use_amp),
-                "amp_dtype": (str(args.amp_dtype) if bool(use_amp) else "fp32"),
-                "scaler_scale": (float(scaler.get_scale()) if (scaler is not None and use_scaler) else None),
-                "tf32": (None if args.tf32 is None else bool(args.tf32)),
+                "feature_set_count": feature_set_count,
+                "temps_count": temps_count,
             }
+            rec.update(
+                _precision_log_fields(
+                    feature_encoder_mode=feature_encoder_mode,
+                    args=args,
+                    use_amp=use_amp,
+                    use_amp_gen=use_amp_gen,
+                    use_scaler=use_scaler,
+                    scaler=scaler,
+                    device=dist_info.device,
+                )
+            )
             if drift_stats is not None:
                 rec["drift_stats_name"] = drift_stats_name
                 rec.update(drift_stats)
@@ -921,6 +1441,7 @@ def main() -> None:
                     "alg2_impl": str(args.alg2_impl),
                     "mask_self_neg": bool(args.mask_self_neg),
                     "dist_metric": str(args.dist_metric),
+                    "drift_theta_norm": bool(args.drift_theta_norm),
                     "sinkhorn_iters": int(args.sinkhorn_iters),
                     "sinkhorn_marginal": str(args.sinkhorn_marginal),
                     "temps": str(args.temps),
@@ -942,16 +1463,17 @@ def main() -> None:
             "ema": ema.state_dict(),
             "scaler": scaler.state_dict() if scaler is not None else None,
             "rng_queue_state": rng_queue_state,
-            "drift_cfg": {
-                "drift_form": str(args.drift_form),
-                "coupling": str(args.coupling),
-                "alg2_impl": str(args.alg2_impl),
-                "mask_self_neg": bool(args.mask_self_neg),
-                "dist_metric": str(args.dist_metric),
-                "sinkhorn_iters": int(args.sinkhorn_iters),
-                "sinkhorn_marginal": str(args.sinkhorn_marginal),
-                "temps": str(args.temps),
-            },
+                "drift_cfg": {
+                    "drift_form": str(args.drift_form),
+                    "coupling": str(args.coupling),
+                    "alg2_impl": str(args.alg2_impl),
+                    "mask_self_neg": bool(args.mask_self_neg),
+                    "dist_metric": str(args.dist_metric),
+                    "drift_theta_norm": bool(args.drift_theta_norm),
+                    "sinkhorn_iters": int(args.sinkhorn_iters),
+                    "sinkhorn_marginal": str(args.sinkhorn_marginal),
+                    "temps": str(args.temps),
+                },
             "args": vars(args),
             "dit_cfg": asdict(dit_cfg),
         }
