@@ -212,8 +212,10 @@ This trains a DiT‑B/2‑like generator that maps:
 
 `z ~ N(0,I)  + class label c + CFG strength ω  →  x_latent ∈ R^{4×32×32}`.
 
-The drifting loss is computed in **latent‑MAE feature space** (Kaiming's Appendix A.5–A.7).
-No SD‑VAE decoder is used during Stage 3 training.
+Feature encoder choices:
+
+- `--feature-encoder mae` (default): drifting loss in **latent‑MAE feature space** (Kaiming's Appendix A.5–A.7).
+- `--feature-encoder moco`: drifting loss in **MoCo-v2 ResNet feature space**. This path decodes generated latents to RGB via SD‑VAE, applies ImageNet normalization, then extracts frozen MoCo features.
 
 ### Baseline (What I am doing now)
 
@@ -251,7 +253,42 @@ python -m imagenet.train_drifting \
 Outputs:
 - Run dir: `runs/imagenet_drift/<timestamp>_<run-name>_<id>/`
 - Checkpoints: `.../checkpoints/ckpt_step_<K>.pt` and `ckpt_final.pt`
+- Online sample grids (optional): `.../samples/step_<K>_omega_<W>_grid.png` + `..._meta.json`
 - Logs: `.../logs.jsonl` (JSONL, one record per `--log-every` steps)
+  - Precision fields are explicit: `precision_mode`, `amp_requested`, `amp_active`,
+    `gen_forward_dtype`, `feature_forward_dtype`, `grad_scaler_enabled`, `tf32_effective`.
+  - `drift_norm` monitoring is enabled by default (`--log-drift-stats`); disable with `--no-log-drift-stats`.
+  - Loss interpretation fields: `feature_set_count`, `temps_count`, `loss_per_feature_set`,
+    `loss_shape_norm` (normalizes by `temps_count^2`).
+  - If online sampling is enabled, logs include `online_sample_grid` and `online_sample_meta`.
+
+### Stage 3 with MoCo-v2 features (skip Stage 2 training)
+
+Download official MoCo-v2 weights (ResNet-50, 800ep) from:
+- https://dl.fbaipublicfiles.com/moco-v2/checkpoint_0199.pth.tar
+
+Then run:
+
+```bash
+torchrun --standalone --nproc_per_node=4 -m imagenet.train_drifting \
+  --feature-encoder moco \
+  --imagenet-root /path/to/imagenet \
+  --moco-ckpt /path/to/checkpoint_0199.pth.tar \
+  --vae-id stabilityai/sd-vae-ft-ema \
+  --vae-dtype fp32 \
+  --amp \
+  --save-every 1000 \
+  --online-sample-every 1000 \
+  --online-sample-count 16 \
+  --online-sample-omega 1.0 \
+  --run-name stage3_moco
+```
+
+Stability defaults in MoCo mode:
+- `--moco-force-fp32` enabled (feature extraction in float32)
+- `--moco-gen-fp32` enabled (generator forward in float32 in MoCo mode)
+- `--moco-clamp-rgb` enabled (decoded RGB clipped to `[0,1]` before normalization)
+- `--fail-on-nan` enabled and mandatory (fail fast on non-finite decode/features/loss/grad/params)
 
 ### Follow-up knobs (for ablations)
 

@@ -48,6 +48,7 @@ import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 from tqdm import tqdm
 from torchvision import transforms
+from torchvision.utils import save_image
 
 from imagenet.data.imagenet_folders import build_imagenet_dataset
 from imagenet.data.latents_memmap import final_paths
@@ -268,6 +269,111 @@ def _precision_log_fields(
     }
 
 
+def _float_tag(v: float) -> str:
+    s = f"{float(v):.6f}".rstrip("0").rstrip(".")
+    if not s:
+        s = "0"
+    if s == "-0":
+        s = "0"
+    return s.replace("-", "m").replace(".", "p")
+
+
+def _build_online_sample_inputs(
+    *,
+    num_samples: int,
+    num_classes: int,
+    seed: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if num_samples <= 0:
+        raise ValueError(f"num_samples must be > 0, got {num_samples}")
+    if num_classes <= 0:
+        raise ValueError(f"num_classes must be > 0, got {num_classes}")
+    gen_device = "cuda" if device.type == "cuda" else "cpu"
+    g = torch.Generator(device=gen_device)
+    g.manual_seed(int(seed))
+    z = torch.randn(int(num_samples), 4, 32, 32, generator=g, device=device, dtype=torch.float32)
+    cls = torch.randint(0, int(num_classes), (int(num_samples),), generator=g, device=device, dtype=torch.long)
+    return z, cls
+
+
+def _decode_latents_to_rgb01_for_save(
+    *,
+    vae,
+    latents: torch.Tensor,
+    scaling_factor: float,
+    clamp_rgb: bool,
+) -> torch.Tensor:
+    vae_param = next(vae.parameters())
+    lat_in = (latents / float(scaling_factor)).to(device=vae_param.device, dtype=vae_param.dtype)
+    dec = vae.decode(lat_in)
+    imgs = dec.sample.to(dtype=torch.float32)
+    if not torch.isfinite(imgs).all():
+        raise FloatingPointError("Non-finite values produced by SD-VAE decode during online sampling.")
+    imgs = 0.5 * (imgs + 1.0)
+    if bool(clamp_rgb):
+        imgs = imgs.clamp(0.0, 1.0)
+    return imgs
+
+
+@torch.no_grad()
+def _save_online_sample_grid(
+    *,
+    gen: torch.nn.Module,
+    vae,
+    samples_dir: str,
+    step_done: int,
+    z_fixed: torch.Tensor,
+    cls_fixed: torch.Tensor,
+    omega: float,
+    vae_scale: float,
+    clamp_rgb: bool,
+    nrow: int,
+) -> tuple[str, str]:
+    if int(nrow) <= 0:
+        raise ValueError(f"nrow must be > 0, got {nrow}")
+    os.makedirs(samples_dir, exist_ok=True)
+
+    was_training = bool(gen.training)
+    gen.eval()
+    try:
+        omega_t = torch.full((int(z_fixed.shape[0]),), float(omega), device=z_fixed.device, dtype=torch.float32)
+        x_lat = gen(z_fixed, cls_fixed, omega_t)
+        imgs = _decode_latents_to_rgb01_for_save(
+            vae=vae,
+            latents=x_lat,
+            scaling_factor=float(vae_scale),
+            clamp_rgb=bool(clamp_rgb),
+        )
+    finally:
+        gen.train(was_training)
+
+    omega_tag = _float_tag(float(omega))
+    stem = f"step_{int(step_done):07d}_omega_{omega_tag}"
+    grid_path = os.path.join(samples_dir, f"{stem}_grid.png")
+    meta_path = os.path.join(samples_dir, f"{stem}_meta.json")
+    save_image(
+        imgs.detach().cpu(),
+        grid_path,
+        nrow=max(1, min(int(nrow), int(imgs.shape[0]))),
+    )
+    with open(meta_path, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "step": int(step_done),
+                "omega": float(omega),
+                "num_samples": int(imgs.shape[0]),
+                "image_h": int(imgs.shape[-2]),
+                "image_w": int(imgs.shape[-1]),
+                "classes": [int(v) for v in cls_fixed.detach().cpu().tolist()],
+            },
+            f,
+            indent=2,
+            sort_keys=True,
+        )
+    return grid_path, meta_path
+
+
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Train drifting generator on ImageNet256 latents (paper §5.2).")
     p.add_argument("--device", type=str, default="cuda")
@@ -429,6 +535,27 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--resume", type=str, default="", help="Resume from a checkpoint path (.pt).")
     p.add_argument("--log-every", type=int, default=10)
     p.add_argument("--save-every", type=int, default=1000)
+    p.add_argument(
+        "--online-sample-every",
+        type=int,
+        default=0,
+        help="If > 0, save a fixed generated image grid every N steps into run/samples/.",
+    )
+    p.add_argument("--online-sample-count", type=int, default=16, help="Number of images per online sample grid.")
+    p.add_argument("--online-sample-nrow", type=int, default=4, help="Images per row in online sample grid.")
+    p.add_argument("--online-sample-omega", type=float, default=1.0, help="CFG omega used for online sample grids.")
+    p.add_argument(
+        "--online-sample-seed",
+        type=int,
+        default=12345,
+        help="Seed used to build fixed (z,class) pairs for comparable online sample grids.",
+    )
+    p.add_argument(
+        "--online-sample-clamp-rgb",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Clamp decoded online sample RGB to [0,1] before saving PNG.",
+    )
     p.add_argument(
         "--log-drift-stats",
         action=argparse.BooleanOptionalAction,
@@ -745,9 +872,18 @@ def main() -> None:
             )
     if str(args.sinkhorn_marginal) != "none" and str(args.coupling) != "sinkhorn":
         raise ValueError("--sinkhorn-marginal is only valid when --coupling=sinkhorn")
+    if int(args.online_sample_every) < 0:
+        raise ValueError("--online-sample-every must be >= 0")
+    if int(args.online_sample_count) < 0:
+        raise ValueError("--online-sample-count must be >= 0")
+    if int(args.online_sample_nrow) <= 0:
+        raise ValueError("--online-sample-nrow must be > 0")
 
     dist_info = init_distributed(device=args.device)
     seed_all(args.seed + dist_info.rank)
+
+    if int(args.online_sample_every) > 0 and int(args.online_sample_count) == 0 and is_main_process():
+        print("Warning: --online-sample-every > 0 but --online-sample-count=0, online sampling is disabled.")
 
     # Optional performance knobs (do not change defaults unless explicitly requested).
     if args.tf32 is not None and dist_info.device.type == "cuda":
@@ -1013,6 +1149,38 @@ def main() -> None:
         return
 
     ddp_gen.train(True)
+    online_sample_every = int(args.online_sample_every)
+    online_sample_enabled = online_sample_every > 0 and int(args.online_sample_count) > 0
+    online_sample_vae = None
+    online_sample_z = None
+    online_sample_cls = None
+    if online_sample_enabled and is_main_process():
+        if feature_encoder_mode == "moco":
+            if vae is None:
+                raise RuntimeError("MoCo mode online sampling requires SD-VAE to be loaded.")
+            online_sample_vae = vae
+        else:
+            vae_cfg = VaeConfig(
+                vae_id=str(args.vae_id),
+                scaling_factor=float(args.vae_scale),
+                dtype=str(args.vae_dtype),
+                encode_mode="mean",
+            )
+            online_sample_vae = load_vae(vae_cfg, dist_info.device)
+        online_sample_z, online_sample_cls = _build_online_sample_inputs(
+            num_samples=int(args.online_sample_count),
+            num_classes=int(args.num_classes),
+            seed=int(args.online_sample_seed),
+            device=dist_info.device,
+        )
+        print(
+            "Online sampling enabled: "
+            f"every={online_sample_every} count={int(args.online_sample_count)} "
+            f"omega={float(args.online_sample_omega):.4f} nrow={int(args.online_sample_nrow)}"
+        )
+    if online_sample_enabled:
+        barrier()
+
     overfit_one_batch = bool(args.overfit_one_batch)
     fixed_cls: np.ndarray | None = None
     fixed_omega_t: torch.Tensor | None = None
@@ -1385,6 +1553,31 @@ def main() -> None:
             else float("nan")
         )
 
+        online_sample_grid = None
+        online_sample_meta = None
+        should_online_sample = bool(online_sample_enabled and (step_done % online_sample_every == 0))
+        if should_online_sample:
+            barrier()
+            if is_main_process():
+                if online_sample_vae is None or online_sample_z is None or online_sample_cls is None:
+                    raise RuntimeError("Online sampling state is not initialized on main process.")
+                grid_path, meta_path = _save_online_sample_grid(
+                    gen=gen,
+                    vae=online_sample_vae,
+                    samples_dir=run.samples_dir,
+                    step_done=step_done,
+                    z_fixed=online_sample_z,
+                    cls_fixed=online_sample_cls,
+                    omega=float(args.online_sample_omega),
+                    vae_scale=float(args.vae_scale),
+                    clamp_rgb=bool(args.online_sample_clamp_rgb),
+                    nrow=int(args.online_sample_nrow),
+                )
+                online_sample_grid = os.path.relpath(grid_path, run.run_dir)
+                online_sample_meta = os.path.relpath(meta_path, run.run_dir)
+                print(f"Saved online sample grid: {grid_path}")
+            barrier()
+
         if do_log:
             # For professor-facing logs we reserve "drift_norm" for an actual drift magnitude.
             # When enabled, 'drift_stats' records 'drift_v_rms' computed from Ṽ for one FeatureSet
@@ -1406,6 +1599,10 @@ def main() -> None:
                 "feature_set_count": feature_set_count,
                 "temps_count": temps_count,
             }
+            if online_sample_grid is not None:
+                rec["online_sample_grid"] = str(online_sample_grid)
+            if online_sample_meta is not None:
+                rec["online_sample_meta"] = str(online_sample_meta)
             rec.update(
                 _precision_log_fields(
                     feature_encoder_mode=feature_encoder_mode,
