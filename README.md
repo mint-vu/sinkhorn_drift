@@ -260,7 +260,7 @@ Each feature encoder mode supports two configurations:
 - **Baseline** (Kaiming's Drift [2]): `--drift-form alg2_joint --coupling partial_two_sided` &mdash; Algorithm 2 with geometric-mean double-softmax coupling
 - **Sinkhorn** (our paper): `--drift-form split --coupling sinkhorn --no-mask-self-neg` &mdash; Algorithm 1, cross-minus-self with doubly-stochastic Sinkhorn couplings
 
-Our Sinkhorn drifting field (Algorithm 1 in our ECCV paper) follows the structure V(X) = P\_cross Y &minus; P\_self X:
+Our Sinkhorn drifting field (Algorithm 1 in our paper) follows the structure V(X) = P\_cross Y &minus; P\_self X:
 - Separate Sinkhorn plans: &Pi;⁺ = Sinkhorn(X, Y⁺), &Pi;⁻ = Sinkhorn(X, Y⁻)
 - Row-normalize to barycentric weights: P⁺ = RowNorm(&Pi;⁺), P⁻ = RowNorm(&Pi;⁻)
 - V = P⁺Y⁺ &minus; P⁻Y⁻
@@ -349,7 +349,7 @@ torchrun --standalone --nproc_per_node=4 -m imagenet.train_drifting \
   --run-name rae_dinov2b_sinkhorn
 ```
 
-### Sinkhorn Notes (Alignment with Our ECCV Paper)
+### Sinkhorn Notes 
 
 Key flags for Sinkhorn (differences from baseline):
 - `--drift-form split`: separate Sinkhorn plans for cross and self coupling (paper Algorithm 1)
