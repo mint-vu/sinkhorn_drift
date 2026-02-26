@@ -61,11 +61,27 @@ def write_meta(out_dir: str, split: str, meta: dict[str, Any]) -> str:
     return str(path)
 
 
-def merge_shards_to_final(out_dir: str, split: str, world_size: int, total_n: int) -> tuple[str, str]:
-    """Merge rank shards into a single memmap in dataset order."""
+def merge_shards_to_final(
+    out_dir: str,
+    split: str,
+    world_size: int,
+    total_n: int,
+    *,
+    latent_shape: Tuple[int, ...] | None = None,
+    latent_dtype: np.dtype = np.float16,
+) -> tuple[str, str]:
+    """Merge rank shards into a single memmap in dataset order.
+
+    If *latent_shape* is not given it is auto-detected from the first shard.
+    """
     latents_path, labels_path = final_paths(out_dir, split)
 
-    latents_mm = open_latents_memmap(latents_path, shape=(total_n, 4, 32, 32), dtype=np.float16, mode="w+")
+    if latent_shape is None:
+        shard0 = np.load(shard_paths(out_dir, split, 0).latents_path, mmap_mode="r")
+        latent_shape = shard0.shape[1:]
+        latent_dtype = shard0.dtype
+
+    latents_mm = open_latents_memmap(latents_path, shape=(total_n, *latent_shape), dtype=latent_dtype, mode="w+")
     labels_mm = open_latents_memmap(labels_path, shape=(total_n,), dtype=np.int64, mode="w+")
 
     for r in range(world_size):
@@ -91,8 +107,8 @@ class LatentsDataset(Dataset):
         self.labels = np.load(labels_path, mmap_mode="r")
         if self.latents.shape[0] != self.labels.shape[0]:
             raise ValueError(f"Latents/labels length mismatch: {self.latents.shape} vs {self.labels.shape}")
-        if self.latents.shape[1:] != (4, 32, 32):
-            raise ValueError(f"Unexpected latent shape: {self.latents.shape} (expected [N,4,32,32])")
+        if self.latents.ndim != 4:
+            raise ValueError(f"Expected 4D latent array [N,C,H,W], got shape {self.latents.shape}")
 
     def __len__(self) -> int:  # type: ignore[override]
         return int(self.labels.shape[0])
