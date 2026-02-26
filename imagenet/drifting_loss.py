@@ -563,7 +563,7 @@ def drifting_loss_for_feature_set(
 
             v_agg = torch.zeros((l, nneg, c), device=x_feat.device, dtype=x_det.dtype)
             for rho in temps:
-                temp_eff = float(rho) * float(c)
+                temp_eff = float(rho) * math.sqrt(float(c))  # Eq. 22: ρ̃_j = ρ · √C_j
 
                 y_neg_norm = drift_y_neg_raw / s
 

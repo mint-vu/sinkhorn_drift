@@ -1,5 +1,10 @@
 """
-Train the drifting generator on ImageNet256 SD-VAE latents (paper §5.2).
+Train the drifting generator on ImageNet256 latents (paper §5.2).
+
+Supports three latent/feature encoder modes:
+  - MAE:  SD-VAE latents [4,32,32] + frozen MAE encoder features
+  - MoCo: SD-VAE latents [4,32,32] + VAE→RGB→MoCo ResNet features
+  - RAE:  RAE latents [C,H,W] + direct latent loss (semantically rich)
 
 Kaiming's paper alignment
 -------------------------
@@ -9,7 +14,8 @@ Kaiming's paper alignment
   generator architecture ('imagenet.models.dit_b2.DiTLatentB2').
 - Appendix A.3:
   MAE encoder checkpoint loaded by '--mae-ckpt' as drifting feature extractor
-  (or MoCo-v2 via '--feature-encoder moco --moco-ckpt').
+  (or MoCo-v2 via '--feature-encoder moco --moco-ckpt',
+   or RAE via '--feature-encoder rae --rae-config').
 - Appendix A.5/A.6:
   feature sets, drift construction, and normalized loss in 'imagenet.drifting_loss'.
 - Appendix A.7:
@@ -284,6 +290,9 @@ def _build_online_sample_inputs(
     num_classes: int,
     seed: int,
     device: torch.device,
+    latent_ch: int = 4,
+    latent_h: int = 32,
+    latent_w: int = 32,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if num_samples <= 0:
         raise ValueError(f"num_samples must be > 0, got {num_samples}")
@@ -292,7 +301,7 @@ def _build_online_sample_inputs(
     gen_device = "cuda" if device.type == "cuda" else "cpu"
     g = torch.Generator(device=gen_device)
     g.manual_seed(int(seed))
-    z = torch.randn(int(num_samples), 4, 32, 32, generator=g, device=device, dtype=torch.float32)
+    z = torch.randn(int(num_samples), latent_ch, latent_h, latent_w, generator=g, device=device, dtype=torch.float32)
     cls = torch.randint(0, int(num_classes), (int(num_samples),), generator=g, device=device, dtype=torch.long)
     return z, cls
 
@@ -329,6 +338,8 @@ def _save_online_sample_grid(
     vae_scale: float,
     clamp_rgb: bool,
     nrow: int,
+    rae_decoder=None,
+    latent_scale_factor: float = 1.0,
 ) -> tuple[str, str]:
     if int(nrow) <= 0:
         raise ValueError(f"nrow must be > 0, got {nrow}")
@@ -339,12 +350,16 @@ def _save_online_sample_grid(
     try:
         omega_t = torch.full((int(z_fixed.shape[0]),), float(omega), device=z_fixed.device, dtype=torch.float32)
         x_lat = gen(z_fixed, cls_fixed, omega_t)
-        imgs = _decode_latents_to_rgb01_for_save(
-            vae=vae,
-            latents=x_lat,
-            scaling_factor=float(vae_scale),
-            clamp_rgb=bool(clamp_rgb),
-        )
+        if rae_decoder is not None:
+            lat_in = x_lat if latent_scale_factor == 1.0 else (x_lat / float(latent_scale_factor))
+            imgs = rae_decoder.decode(lat_in).clamp(0.0, 1.0)
+        else:
+            imgs = _decode_latents_to_rgb01_for_save(
+                vae=vae,
+                latents=x_lat,
+                scaling_factor=float(vae_scale),
+                clamp_rgb=bool(clamp_rgb),
+            )
     finally:
         gen.train(was_training)
 
@@ -396,7 +411,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--queue-push", type=int, default=64, help="Number of new real samples pushed per step (Appendix A.8).")
 
     # Feature encoder
-    p.add_argument("--feature-encoder", type=str, choices=["mae", "moco"], default="mae")
+    p.add_argument("--feature-encoder", type=str, choices=["mae", "moco", "rae"], default="mae")
     p.add_argument("--mae-ckpt", type=str, default="")
     p.add_argument("--mae-use-ema", action="store_true", help="Use EMA weights from MAE checkpoint.")
     p.add_argument("--mae-every-n-blocks", type=int, default=2)
@@ -427,6 +442,11 @@ def _parse_args() -> argparse.Namespace:
         default=True,
         help="Run generator forward in float32 in MoCo mode to reduce fp16 gradient overflow risk.",
     )
+
+    # RAE feature encoder
+    p.add_argument("--rae-config", type=str, default="", help="Path to RAE yaml config (required for --feature-encoder=rae).")
+    p.add_argument("--rae-latents-dir", type=str, default="", help="Path to pre-computed RAE latents dir (defaults to --latents-dir).")
+    p.add_argument("--latent-scale-factor", type=float, default=1.0, help="Scale factor applied to generated latents before RAE decode.")
 
     # Generator (DiT-B/2; Table 8)
     p.add_argument("--hidden-dim", type=int, default=768)
@@ -853,6 +873,9 @@ def main() -> None:
             raise ValueError("--moco-input-size must be >= --moco-center-crop")
         if str(args.drift_stats_name) == "vanilla.latent":
             args.drift_stats_name = "enc00.loc"
+    elif feature_encoder_mode == "rae":
+        if not str(args.rae_config).strip():
+            raise ValueError("--rae-config is required when --feature-encoder=rae")
     else:
         raise ValueError(f"Unknown --feature-encoder={feature_encoder_mode}")
 
@@ -945,6 +968,15 @@ def main() -> None:
             lat_mm = lat_mm[:n_data]
             lab_mm = lab_mm[:n_data]
         labels_np = np.asarray(lab_mm, dtype=np.int64)
+    elif feature_encoder_mode == "rae":
+        rae_dir = str(args.rae_latents_dir).strip() or str(args.latents_dir)
+        lat_mm, lab_mm = _load_latents(rae_dir, args.split)
+        n_data = int(lab_mm.shape[0])
+        if args.max_items and args.max_items > 0:
+            n_data = min(n_data, int(args.max_items))
+            lat_mm = lat_mm[:n_data]
+            lab_mm = lab_mm[:n_data]
+        labels_np = np.asarray(lab_mm, dtype=np.int64)
     else:
         real_transform = _build_moco_real_transform(
             resize_size=int(args.moco_input_size),
@@ -1013,9 +1045,48 @@ def main() -> None:
     vae = None
     moco_mean_t = None
     moco_std_t = None
+    rae_model = None
+    encoder = None
     if feature_encoder_mode == "mae":
         encoder, encoder_meta = _load_mae_encoder(args.mae_ckpt, dist_info.device, use_ema=bool(args.mae_use_ema))
         feature_meta = {"feature_encoder": "mae", **encoder_meta}
+    elif feature_encoder_mode == "rae":
+        # RAE: no separate feature encoder needed — drift loss on latents directly.
+        # Load RAE model only for online sampling decode.
+        import sys as _sys
+        _rae_src = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "rae", "src")
+        if _rae_src not in _sys.path:
+            _sys.path.insert(0, _rae_src)
+        from omegaconf import OmegaConf as _OmegaConf
+        from utils.model_utils import instantiate_from_config as _instantiate_from_config
+
+        _rae_cfg_dict = _OmegaConf.load(str(args.rae_config))
+        _stage1_cfg = _rae_cfg_dict.get("stage_1")
+        if _stage1_cfg is None:
+            raise ValueError(f"RAE config {args.rae_config} must have a 'stage_1' section.")
+        # Resolve relative paths in RAE config.
+        _cfg_dir = os.path.dirname(os.path.abspath(str(args.rae_config)))
+        _rae_root = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "rae")
+        _params = dict(_stage1_cfg.get("params", {}))
+        for _key in ("decoder_config_path", "pretrained_decoder_path", "normalization_stat_path"):
+            _val = _params.get(_key)
+            if _val is not None and not os.path.isabs(str(_val)):
+                for _base in (_cfg_dir, _rae_root, os.path.join(_rae_root, "src")):
+                    _cand = os.path.join(_base, str(_val))
+                    if os.path.exists(_cand):
+                        _params[_key] = _cand
+                        break
+        _stage1_resolved = dict(_stage1_cfg)
+        _stage1_resolved["params"] = _params
+        rae_model = _instantiate_from_config(_stage1_resolved).to(dist_info.device)
+        rae_model.eval()
+        for p in rae_model.parameters():
+            p.requires_grad_(False)
+        feature_meta = {
+            "feature_encoder": "rae",
+            "rae_config": str(args.rae_config),
+            "latent_scale_factor": float(args.latent_scale_factor),
+        }
     else:
         encoder, moco_meta = load_moco_resnet_encoder(
             args.moco_ckpt,
@@ -1048,6 +1119,15 @@ def main() -> None:
             "moco_gen_fp32": bool(args.moco_gen_fp32),
         }
 
+    # Detect latent shape from loaded memmap (for dynamic DiT config).
+    if lat_mm is not None:
+        latent_ch = int(lat_mm.shape[1])
+        latent_h = int(lat_mm.shape[2])
+        latent_w = int(lat_mm.shape[3])
+    else:
+        # MoCo mode: SD-VAE latents are always [4, 32, 32].
+        latent_ch, latent_h, latent_w = 4, 32, 32
+
     # Generator.
     if resume_ckpt is not None and isinstance(resume_ckpt.get("dit_cfg"), dict):
         cfg_dict = dict(resume_ckpt["dit_cfg"])
@@ -1057,6 +1137,9 @@ def main() -> None:
     else:
         dit_cfg = DiTB2Config(
             num_classes=int(args.num_classes),
+            in_ch=latent_ch,
+            out_ch=latent_ch,
+            input_size=latent_h,
             hidden_dim=int(args.hidden_dim),
             depth=int(args.depth),
             n_heads=int(args.n_heads),
@@ -1154,8 +1237,12 @@ def main() -> None:
     online_sample_vae = None
     online_sample_z = None
     online_sample_cls = None
+    online_sample_vae = None
     if online_sample_enabled and is_main_process():
-        if feature_encoder_mode == "moco":
+        if feature_encoder_mode == "rae":
+            # RAE mode: use rae_model for decode (already loaded above).
+            pass
+        elif feature_encoder_mode == "moco":
             if vae is None:
                 raise RuntimeError("MoCo mode online sampling requires SD-VAE to be loaded.")
             online_sample_vae = vae
@@ -1172,6 +1259,9 @@ def main() -> None:
             num_classes=int(args.num_classes),
             seed=int(args.online_sample_seed),
             device=dist_info.device,
+            latent_ch=latent_ch,
+            latent_h=latent_h,
+            latent_w=latent_w,
         )
         print(
             "Online sampling enabled: "
@@ -1273,7 +1363,7 @@ def main() -> None:
                 uncond_idx = np.asarray(cached["uncond_idx"], dtype=np.int64)
             else:
                 # Noise -> generated latents
-                z = torch.randn(int(args.nneg), 4, 32, 32, device=dist_info.device)
+                z = torch.randn(int(args.nneg), latent_ch, latent_h, latent_w, device=dist_info.device)
 
                 # Positives + unconditionals (real samples)
                 if queue is not None:
@@ -1297,14 +1387,14 @@ def main() -> None:
 
             c_lab = torch.full((int(args.nneg),), c, device=dist_info.device, dtype=torch.long)
             omega_rep = omega_c.expand(int(args.nneg))
-            if feature_encoder_mode == "mae":
+            if feature_encoder_mode in ("mae", "rae"):
                 if lat_mm is None:
-                    raise RuntimeError("Latent memmap is not loaded for MAE feature mode.")
+                    raise RuntimeError("Latent memmap is not loaded for MAE/RAE feature mode.")
                 pos_lat = torch.from_numpy(lat_mm[pos_idx]).to(dist_info.device).float()
                 uncond_lat = (
                     torch.from_numpy(lat_mm[uncond_idx]).to(dist_info.device).float()
                     if args.nuncond > 0
-                    else torch.empty((0, 4, 32, 32), device=dist_info.device)
+                    else torch.empty((0, latent_ch, latent_h, latent_w), device=dist_info.device)
                 )
             else:
                 if image_ds is None:
@@ -1345,6 +1435,19 @@ def main() -> None:
                                 unc_sets = _feature_sets_from_maps(maps_unc)
                                 unc_sets.extend(feature_sets_from_encoder_input(uncond_lat))
                                 unc_sets.append(flatten_latents_as_feature_set(uncond_lat))
+                            else:
+                                unc_sets = []
+                elif feature_encoder_mode == "rae":
+                    # RAE: direct latent loss — RAE latents are already semantic.
+                    with amp_ctx:
+                        x_lat = ddp_gen(z, c_lab, omega_rep)
+
+                        x_sets = [flatten_latents_as_feature_set(x_lat)]
+
+                        with torch.no_grad():
+                            pos_sets = [flatten_latents_as_feature_set(pos_lat)]
+                            if int(args.nuncond) > 0:
+                                unc_sets = [flatten_latents_as_feature_set(uncond_lat)]
                             else:
                                 unc_sets = []
                 else:
@@ -1559,8 +1662,10 @@ def main() -> None:
         if should_online_sample:
             barrier()
             if is_main_process():
-                if online_sample_vae is None or online_sample_z is None or online_sample_cls is None:
+                if online_sample_z is None or online_sample_cls is None:
                     raise RuntimeError("Online sampling state is not initialized on main process.")
+                if online_sample_vae is None and rae_model is None:
+                    raise RuntimeError("Online sampling requires either SD-VAE or RAE decoder to be loaded.")
                 grid_path, meta_path = _save_online_sample_grid(
                     gen=gen,
                     vae=online_sample_vae,
@@ -1572,6 +1677,8 @@ def main() -> None:
                     vae_scale=float(args.vae_scale),
                     clamp_rgb=bool(args.online_sample_clamp_rgb),
                     nrow=int(args.online_sample_nrow),
+                    rae_decoder=rae_model,
+                    latent_scale_factor=float(args.latent_scale_factor),
                 )
                 online_sample_grid = os.path.relpath(grid_path, run.run_dir)
                 online_sample_meta = os.path.relpath(meta_path, run.run_dir)
