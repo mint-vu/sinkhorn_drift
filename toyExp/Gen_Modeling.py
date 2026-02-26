@@ -235,7 +235,7 @@ def make_8gaussians(n: int, std: float = 0.08, radius: float = 2.0, seed: int = 
     return x.astype(np.float32)
 
 
-def make_checkerboard(n: int, n_tiles: int = 4, seed: int = 0) -> np.ndarray:
+def make_checkerboard(n: int, n_tiles: int = 4, noise: float = 0.05, seed: int = 0) -> np.ndarray:
     rng = np.random.default_rng(seed)
     x = rng.random(n) * n_tiles
     y = rng.random(n) * n_tiles
@@ -250,6 +250,8 @@ def make_checkerboard(n: int, n_tiles: int = 4, seed: int = 0) -> np.ndarray:
     x, y = x[:n], y[:n]
     pts = np.stack([x, y], axis=1)
     pts = (pts / n_tiles) * 4.0 - 2.0
+    if noise > 0:
+        pts = pts + rng.normal(scale=noise, size=pts.shape)
     return pts.astype(np.float32)
 
 
@@ -360,12 +362,16 @@ def plan_one_sided_plain(
     eps: float,
     use_float64: bool = False,
     dist_metric: str = "l2_sq",
+    mask_diag: bool = False,
 ) -> torch.Tensor:
     out_dtype = x.dtype
     if use_float64:
         x = x.to(torch.float64)
         y = y.to(torch.float64)
     d = pairwise_dists(x, y, metric=dist_metric)
+    if mask_diag and d.shape[0] == d.shape[1]:
+        d = d.clone()
+        d.fill_diagonal_(float("inf"))
     p = torch.softmax(-d / eps, dim=1)
     return p.to(out_dtype)
 
@@ -376,6 +382,7 @@ def plan_two_sided_plain(
     eps: float,
     use_float64: bool = False,
     dist_metric: str = "l2_sq",
+    mask_diag: bool = False,
 ) -> torch.Tensor:
     out_dtype = x.dtype
     if use_float64:
@@ -388,6 +395,9 @@ def plan_two_sided_plain(
     tiny_sqrt = 1e-24
 
     d = pairwise_dists(x, y, metric=dist_metric)
+    if mask_diag and d.shape[0] == d.shape[1]:
+        d = d.clone()
+        d.fill_diagonal_(float("inf"))
     k = torch.exp(-d / eps)
     a_row = k / (k.sum(dim=1, keepdim=True) + tiny)
     a_col = k / (k.sum(dim=0, keepdim=True) + tiny)
@@ -403,6 +413,7 @@ def plan_sinkhorn_plain(
     iters: int = 30,
     use_float64: bool = False,
     dist_metric: str = "l2_sq",
+    mask_diag: bool = False,
 ) -> torch.Tensor:
     out_dtype = x.dtype
     if use_float64:
@@ -414,6 +425,9 @@ def plan_sinkhorn_plain(
 
     n, m = x.shape[0], y.shape[0]
     d = pairwise_dists(x, y, metric=dist_metric)
+    if mask_diag and d.shape[0] == d.shape[1]:
+        d = d.clone()
+        d.fill_diagonal_(float("inf"))
     k = torch.exp(-d / eps).clamp_min(tiny)
 
     r = torch.full((n,), 1.0 / n, device=x.device, dtype=x.dtype)
@@ -431,16 +445,22 @@ def plan_sinkhorn_plain(
 
 
 # Log-space implementation (stable version)
-def plan_one_sided_log(x: torch.Tensor, y: torch.Tensor, eps: float, dist_metric: str = "l2_sq") -> torch.Tensor:
+def plan_one_sided_log(x: torch.Tensor, y: torch.Tensor, eps: float, dist_metric: str = "l2_sq", mask_diag: bool = False) -> torch.Tensor:
     d = pairwise_dists(x, y, metric=dist_metric)
     logits = -d / eps
+    if mask_diag and logits.shape[0] == logits.shape[1]:
+        logits = logits.clone()
+        logits.fill_diagonal_(float("-inf"))
     log_t = logits - torch.logsumexp(logits, dim=1, keepdim=True)
     return torch.exp(log_t)
 
 
-def plan_two_sided_log(x: torch.Tensor, y: torch.Tensor, eps: float, dist_metric: str = "l2_sq") -> torch.Tensor:
+def plan_two_sided_log(x: torch.Tensor, y: torch.Tensor, eps: float, dist_metric: str = "l2_sq", mask_diag: bool = False) -> torch.Tensor:
     d = pairwise_dists(x, y, metric=dist_metric)
     logits = -d / eps
+    if mask_diag and logits.shape[0] == logits.shape[1]:
+        logits = logits.clone()
+        logits.fill_diagonal_(float("-inf"))
     log_row = logits - torch.logsumexp(logits, dim=1, keepdim=True)
     log_col = logits - torch.logsumexp(logits, dim=0, keepdim=True)
     log_t = 0.5 * (log_row + log_col)
@@ -455,9 +475,12 @@ def plan_two_sided_log(x: torch.Tensor, y: torch.Tensor, eps: float, dist_metric
     return t
 
 
-def plan_sinkhorn_log(x: torch.Tensor, y: torch.Tensor, eps: float, iters: int = 30, dist_metric: str = "l2_sq") -> torch.Tensor:
+def plan_sinkhorn_log(x: torch.Tensor, y: torch.Tensor, eps: float, iters: int = 30, dist_metric: str = "l2_sq", mask_diag: bool = False) -> torch.Tensor:
     d = pairwise_dists(x, y, metric=dist_metric)
     log_t = -d / eps
+    if mask_diag and log_t.shape[0] == log_t.shape[1]:
+        log_t = log_t.clone()
+        log_t.fill_diagonal_(float("-inf"))
     for _ in range(iters):
         log_t = log_t - torch.logsumexp(log_t, dim=1, keepdim=True)
         log_t = log_t - torch.logsumexp(log_t, dim=0, keepdim=True)
@@ -494,13 +517,17 @@ def compute_drift(
     if impl not in {"plain", "log"}:
         raise ValueError(f"Unknown drift_impl: {drift_impl}")
 
+    # Pre-mask: mask diagonal before softmax/kernel (Kaiming style).
+    # Only for one/two-sided repulsion; sinkhorn never masks.
+    pre_mask = repulsion_mask_diag and dtype != "sinkhorn"
+
     if impl == "plain":
         if dtype == "one-sided":
             pxy = plan_one_sided_plain(x, y, eps, use_float64=plan_float64, dist_metric=dist_metric)
-            pxx = plan_one_sided_plain(x, x, eps, use_float64=plan_float64, dist_metric=dist_metric)
+            pxx = plan_one_sided_plain(x, x, eps, use_float64=plan_float64, dist_metric=dist_metric, mask_diag=pre_mask)
         elif dtype == "two-sided":
             pxy = plan_two_sided_plain(x, y, eps, use_float64=plan_float64, dist_metric=dist_metric)
-            pxx = plan_two_sided_plain(x, x, eps, use_float64=plan_float64, dist_metric=dist_metric)
+            pxx = plan_two_sided_plain(x, x, eps, use_float64=plan_float64, dist_metric=dist_metric, mask_diag=pre_mask)
         elif dtype == "sinkhorn":
             pxy = plan_sinkhorn_plain(x, y, eps, iters=sinkhorn_iters, use_float64=plan_float64, dist_metric=dist_metric)
             pxx = plan_sinkhorn_plain(x, x, eps, iters=sinkhorn_iters, use_float64=plan_float64, dist_metric=dist_metric)
@@ -509,34 +536,79 @@ def compute_drift(
     else:
         if dtype == "one-sided":
             pxy = plan_one_sided_log(x, y, eps, dist_metric=dist_metric)
-            pxx = plan_one_sided_log(x, x, eps, dist_metric=dist_metric)
+            pxx = plan_one_sided_log(x, x, eps, dist_metric=dist_metric, mask_diag=pre_mask)
         elif dtype == "two-sided":
             pxy = plan_two_sided_log(x, y, eps, dist_metric=dist_metric)
-            pxx = plan_two_sided_log(x, x, eps, dist_metric=dist_metric)
+            pxx = plan_two_sided_log(x, x, eps, dist_metric=dist_metric, mask_diag=pre_mask)
         elif dtype == "sinkhorn":
             pxy = plan_sinkhorn_log(x, y, eps, iters=sinkhorn_iters, dist_metric=dist_metric)
             pxx = plan_sinkhorn_log(x, x, eps, iters=sinkhorn_iters, dist_metric=dist_metric)
         else:
             raise ValueError(f"Unknown drift_type: {drift_type}")
 
-    # Keep the professor mask rule: one/two-sided mask, sinkhorn no mask.
-    tiny = 1e-12
-    if repulsion_mask_diag and dtype != "sinkhorn":
-        n = x.shape[0]
-        mask = torch.ones((n, n), device=x.device, dtype=pxx.dtype)
-        mask.fill_diagonal_(0.0)
-        pxx = pxx * mask
-        pxx = pxx / (pxx.sum(dim=1, keepdim=True) + tiny)
+    # ────────────────────────────────────────────────────────────────
+    # Drift field computation  (split formulation)
+    #
+    # References:
+    #   Kaiming
+    #   Ours
+    #
+    # Continuous definition  ([Kaiming] Eq.(8)/(10), [Ours] Eq.(1)/(3)):
+    #
+    #   V_{p,q}(x) = V_p^+(x) - V_q^-(x)
+    #
+    #   V_p^+(x) = (1/Z_p(x)) * E_{y+ ~ p}[ k(x, y+) (y+ - x) ]
+    #   V_q^-(x) = (1/Z_q(x)) * E_{y- ~ q}[ k(x, y-) (y- - x) ]
+    #
+    #   where Z_p(x) = E_{y+}[k(x,y+)],  Z_q(x) = E_{y-}[k(x,y-)]
+    #
+    # Discrete form with row-stochastic P  ([Ours] Eq.(4)):
+    #
+    #   P_XY[i,j] = k(x_i, y_j) / sum_l k(x_i, y_l)   (one-sided)
+    #   P_XX[i,j] = k(x_i, x_j) / sum_l k(x_i, x_l)   (one-sided)
+    #
+    #   (For two-sided: P = sqrt(row-norm * col-norm), then re-row-normalize.
+    #    For sinkhorn: P = RowNormalize(Sinkhorn(K, r, c, T)).)
+    #
+    # Since P is row-stochastic (sum_j P[i,j] = 1):
+    #
+    #   V_p^+(x_i) = sum_j P_XY[i,j] (y_j - x_i)
+    #              = sum_j P_XY[i,j] y_j  -  x_i * sum_j P_XY[i,j]
+    #              = sum_j P_XY[i,j] y_j  -  x_i
+    #              = (P_XY @ Y)_i - x_i              -v_attr
+    #
+    #   V_q^-(x_i) = sum_j P_XX[i,j] (x_j - x_i)
+    #              = sum_j P_XX[i,j] x_j  -  x_i
+    #              = (P_XX @ X)_i - x_i              -v_rep
+    #
+    # Final drift:
+    #
+    #   V(x_i) = v_attr_i - v_rep_i
+    #          = [(P_XY @ Y)_i - x_i] - [(P_XX @ X)_i - x_i]
+    #          = (P_XY @ Y)_i - (P_XX @ X)_i
+    #
+    # Equivalent to [Ours] Eq.(4) / Alg.1 line 14:
+    #   V(x_i) = sum_j P_XY[i,j] y_j  -  sum_j P_XX[i,j] x_j
+    #          = P_XY @ Y  -  P_XX @ X
+    #
+    # Note: [Kaiming] Alg.2 (appendix) uses a JOINT [N, N_pos+N_neg]
+    # matrix with two-sided normalization, implementing the compact form
+    # ([Kaiming] Eq.(11)):
+    #   V(x) = (1/(Z_p Z_q)) E[ k(x,y+) k(x,y-) (y+ - y-) ]
+    # Our split formulation computes P_XY and P_XX independently,
+    # which is equivalent when using one-sided normalization, and
+    # differs slightly for two-sided (split vs joint column-softmax).
+    # ────────────────────────────────────────────────────────────────
 
     # Keep barycentric computation in plan dtype for plain+float64 path.
     x_bary = x.to(pxy.dtype)
     y_bary = y.to(pxy.dtype)
 
-    bary_xy = pxy @ y_bary
-    bary_xx = pxx @ x_bary
-    v_attr = bary_xy - x_bary
-    v_rep = bary_xx - x_bary
-    return (v_attr - v_rep).to(x_dtype)
+    bary_xy = pxy @ y_bary              # sum_j P_XY[i,j] * y_j
+    bary_xx = pxx @ x_bary              # sum_j P_XX[i,j] * x_j
+    v_attr = bary_xy - x_bary           # V_p^+(x) = P_XY @ Y - X
+    v_rep = bary_xx - x_bary            # V_q^-(x) = P_XX @ X - X
+    return (v_attr - v_rep).to(x_dtype)  # V = V^+ - V^- = P_XY@Y - P_XX@X
 
 
 # ----------------------------

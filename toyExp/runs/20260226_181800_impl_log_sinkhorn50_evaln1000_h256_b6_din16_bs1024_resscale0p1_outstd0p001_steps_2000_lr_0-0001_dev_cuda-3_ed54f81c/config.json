@@ -1,0 +1,61 @@
+{
+  "args": {
+    "batch_size": 1024,
+    "blocks": 6,
+    "device": "cuda:3",
+    "dim_in": 16,
+    "dist_metric": "l2_sq",
+    "drift_impl": "log",
+    "eps_list": "0.01",
+    "eval_every": 100,
+    "eval_n": 1000,
+    "eval_warmup_every": 1,
+    "eval_warmup_steps": 0,
+    "hidden": 256,
+    "lr": 0.0001,
+    "lr_gamma": 0.5,
+    "lr_schedule": "none",
+    "lr_step_size": 500,
+    "methods": "one-sided,two-sided,sinkhorn",
+    "min_lr": 0.0,
+    "no_run_dir": false,
+    "out_init_std": 0.001,
+    "out_root": "runs",
+    "plan_float64": false,
+    "res_scale": 0.1,
+    "run_name": null,
+    "seed": 42,
+    "sinkhorn_iters": 50,
+    "steps": 2000,
+    "targets": "Moons,Spiral,8-Gaussians,Checkerboard"
+  },
+  "batch_size": 1024,
+  "created_at": "20260226_181800",
+  "env": {
+    "cuda_available": true,
+    "cuda_version": "12.4",
+    "cudnn_version": 91002,
+    "numpy": "2.2.6",
+    "python": "3.10.19 (main, Oct 21 2025, 16:43:05) [GCC 11.2.0]",
+    "torch": "2.6.0+cu124"
+  },
+  "eps_list": [
+    0.01
+  ],
+  "eval_every": 100,
+  "eval_warmup_every": 1,
+  "eval_warmup_steps": 0,
+  "methods": [
+    "one-sided",
+    "two-sided",
+    "sinkhorn"
+  ],
+  "run_dir": "runs/20260226_181800_impl_log_sinkhorn50_evaln1000_h256_b6_din16_bs1024_resscale0p1_outstd0p001_steps_2000_lr_0-0001_dev_cuda-3_ed54f81c",
+  "run_tag": "sinkhorn50_evaln1000_h256_b6_din16_bs1024_resscale0p1_outstd0p001",
+  "targets": [
+    "Moons",
+    "Spiral",
+    "8-Gaussians",
+    "Checkerboard"
+  ]
+}

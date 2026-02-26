@@ -1,0 +1,1 @@
+Gen_Modeling.py --device cuda:3 --drift-impl log --sinkhorn-iters 50 --steps 2000 --hidden 256 --blocks 6 --dim-in 16 --res-scale 0.1 --out-init-std 1e-3 --batch-size 1024 --lr 1e-4 --dist-metric l2
