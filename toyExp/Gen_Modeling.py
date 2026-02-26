@@ -341,19 +341,32 @@ def pairwise_sq_dists(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     return x2 - 2 * x @ y.t() + y2
 
 
+def pairwise_dists(x: torch.Tensor, y: torch.Tensor, metric: str = "l2_sq") -> torch.Tensor:
+    """
+    Pairwise distance: 'l2_sq' for ||x-y||^2, 'l2' for ||x-y||.
+    """
+    d2 = pairwise_sq_dists(x, y)
+    if metric == "l2_sq":
+        return d2
+    if metric == "l2":
+        return torch.sqrt(d2.clamp_min(1e-24))
+    raise ValueError(f"Unknown dist_metric: {metric}")
+
+
 # Plain-space implementation (professor version)
 def plan_one_sided_plain(
     x: torch.Tensor,
     y: torch.Tensor,
     eps: float,
     use_float64: bool = False,
+    dist_metric: str = "l2_sq",
 ) -> torch.Tensor:
     out_dtype = x.dtype
     if use_float64:
         x = x.to(torch.float64)
         y = y.to(torch.float64)
-    d2 = pairwise_sq_dists(x, y)
-    p = torch.softmax(-d2 / eps, dim=1)
+    d = pairwise_dists(x, y, metric=dist_metric)
+    p = torch.softmax(-d / eps, dim=1)
     return p.to(out_dtype)
 
 
@@ -362,6 +375,7 @@ def plan_two_sided_plain(
     y: torch.Tensor,
     eps: float,
     use_float64: bool = False,
+    dist_metric: str = "l2_sq",
 ) -> torch.Tensor:
     out_dtype = x.dtype
     if use_float64:
@@ -373,8 +387,8 @@ def plan_two_sided_plain(
     tiny = 1e-12
     tiny_sqrt = 1e-24
 
-    d2 = pairwise_sq_dists(x, y)
-    k = torch.exp(-d2 / eps)
+    d = pairwise_dists(x, y, metric=dist_metric)
+    k = torch.exp(-d / eps)
     a_row = k / (k.sum(dim=1, keepdim=True) + tiny)
     a_col = k / (k.sum(dim=0, keepdim=True) + tiny)
     a = torch.sqrt(a_row * a_col + tiny_sqrt)
@@ -388,6 +402,7 @@ def plan_sinkhorn_plain(
     eps: float,
     iters: int = 30,
     use_float64: bool = False,
+    dist_metric: str = "l2_sq",
 ) -> torch.Tensor:
     out_dtype = x.dtype
     if use_float64:
@@ -398,8 +413,8 @@ def plan_sinkhorn_plain(
     tiny = 1e-12
 
     n, m = x.shape[0], y.shape[0]
-    d2 = pairwise_sq_dists(x, y)
-    k = torch.exp(-d2 / eps).clamp_min(tiny)
+    d = pairwise_dists(x, y, metric=dist_metric)
+    k = torch.exp(-d / eps).clamp_min(tiny)
 
     r = torch.full((n,), 1.0 / n, device=x.device, dtype=x.dtype)
     c = torch.full((m,), 1.0 / m, device=x.device, dtype=x.dtype)
@@ -416,16 +431,16 @@ def plan_sinkhorn_plain(
 
 
 # Log-space implementation (stable version)
-def plan_one_sided_log(x: torch.Tensor, y: torch.Tensor, eps: float) -> torch.Tensor:
-    d2 = pairwise_sq_dists(x, y)
-    logits = -d2 / eps
+def plan_one_sided_log(x: torch.Tensor, y: torch.Tensor, eps: float, dist_metric: str = "l2_sq") -> torch.Tensor:
+    d = pairwise_dists(x, y, metric=dist_metric)
+    logits = -d / eps
     log_t = logits - torch.logsumexp(logits, dim=1, keepdim=True)
     return torch.exp(log_t)
 
 
-def plan_two_sided_log(x: torch.Tensor, y: torch.Tensor, eps: float) -> torch.Tensor:
-    d2 = pairwise_sq_dists(x, y)
-    logits = -d2 / eps
+def plan_two_sided_log(x: torch.Tensor, y: torch.Tensor, eps: float, dist_metric: str = "l2_sq") -> torch.Tensor:
+    d = pairwise_dists(x, y, metric=dist_metric)
+    logits = -d / eps
     log_row = logits - torch.logsumexp(logits, dim=1, keepdim=True)
     log_col = logits - torch.logsumexp(logits, dim=0, keepdim=True)
     log_t = 0.5 * (log_row + log_col)
@@ -440,9 +455,9 @@ def plan_two_sided_log(x: torch.Tensor, y: torch.Tensor, eps: float) -> torch.Te
     return t
 
 
-def plan_sinkhorn_log(x: torch.Tensor, y: torch.Tensor, eps: float, iters: int = 30) -> torch.Tensor:
-    d2 = pairwise_sq_dists(x, y)
-    log_t = -d2 / eps
+def plan_sinkhorn_log(x: torch.Tensor, y: torch.Tensor, eps: float, iters: int = 30, dist_metric: str = "l2_sq") -> torch.Tensor:
+    d = pairwise_dists(x, y, metric=dist_metric)
+    log_t = -d / eps
     for _ in range(iters):
         log_t = log_t - torch.logsumexp(log_t, dim=1, keepdim=True)
         log_t = log_t - torch.logsumexp(log_t, dim=0, keepdim=True)
@@ -461,6 +476,7 @@ def compute_drift(
     repulsion_mask_diag: bool = True,
     drift_impl: str = "plain",
     plan_float64: bool = False,
+    dist_metric: str = "l2_sq",
 ) -> torch.Tensor:
     """
     Drift: V(x) = V_attr(x,y) - V_rep(x,x)
@@ -480,26 +496,26 @@ def compute_drift(
 
     if impl == "plain":
         if dtype == "one-sided":
-            pxy = plan_one_sided_plain(x, y, eps, use_float64=plan_float64)
-            pxx = plan_one_sided_plain(x, x, eps, use_float64=plan_float64)
+            pxy = plan_one_sided_plain(x, y, eps, use_float64=plan_float64, dist_metric=dist_metric)
+            pxx = plan_one_sided_plain(x, x, eps, use_float64=plan_float64, dist_metric=dist_metric)
         elif dtype == "two-sided":
-            pxy = plan_two_sided_plain(x, y, eps, use_float64=plan_float64)
-            pxx = plan_two_sided_plain(x, x, eps, use_float64=plan_float64)
+            pxy = plan_two_sided_plain(x, y, eps, use_float64=plan_float64, dist_metric=dist_metric)
+            pxx = plan_two_sided_plain(x, x, eps, use_float64=plan_float64, dist_metric=dist_metric)
         elif dtype == "sinkhorn":
-            pxy = plan_sinkhorn_plain(x, y, eps, iters=sinkhorn_iters, use_float64=plan_float64)
-            pxx = plan_sinkhorn_plain(x, x, eps, iters=sinkhorn_iters, use_float64=plan_float64)
+            pxy = plan_sinkhorn_plain(x, y, eps, iters=sinkhorn_iters, use_float64=plan_float64, dist_metric=dist_metric)
+            pxx = plan_sinkhorn_plain(x, x, eps, iters=sinkhorn_iters, use_float64=plan_float64, dist_metric=dist_metric)
         else:
             raise ValueError(f"Unknown drift_type: {drift_type}")
     else:
         if dtype == "one-sided":
-            pxy = plan_one_sided_log(x, y, eps)
-            pxx = plan_one_sided_log(x, x, eps)
+            pxy = plan_one_sided_log(x, y, eps, dist_metric=dist_metric)
+            pxx = plan_one_sided_log(x, x, eps, dist_metric=dist_metric)
         elif dtype == "two-sided":
-            pxy = plan_two_sided_log(x, y, eps)
-            pxx = plan_two_sided_log(x, x, eps)
+            pxy = plan_two_sided_log(x, y, eps, dist_metric=dist_metric)
+            pxx = plan_two_sided_log(x, x, eps, dist_metric=dist_metric)
         elif dtype == "sinkhorn":
-            pxy = plan_sinkhorn_log(x, y, eps, iters=sinkhorn_iters)
-            pxx = plan_sinkhorn_log(x, x, eps, iters=sinkhorn_iters)
+            pxy = plan_sinkhorn_log(x, y, eps, iters=sinkhorn_iters, dist_metric=dist_metric)
+            pxx = plan_sinkhorn_log(x, x, eps, iters=sinkhorn_iters, dist_metric=dist_metric)
         else:
             raise ValueError(f"Unknown drift_type: {drift_type}")
 
@@ -572,6 +588,7 @@ class TrainConfig:
     sinkhorn_iters: int = 30
     drift_impl: str = "plain"      # plain | log
     plan_float64: bool = False     # apply float64 inside plain-space plan computations
+    dist_metric: str = "l2_sq"    # l2_sq | l2
 
     # eval
     eval_every: int = 100
@@ -630,6 +647,7 @@ def train_one_return_model(target_name: str, cfg: TrainConfig) -> Tuple[Dict, nn
                 repulsion_mask_diag=True,
                 drift_impl=cfg.drift_impl,
                 plan_float64=cfg.plan_float64,
+                dist_metric=cfg.dist_metric,
             )
             x_target = x + v
 
@@ -701,6 +719,7 @@ def compare_all_and_return_models(
     out_init_std: float | None = None,
     drift_impl: str = "plain",
     plan_float64: bool = False,
+    dist_metric: str = "l2_sq",
     return_logs: bool = False,
 ):
     targets = _as_tuple(targets)
@@ -737,6 +756,7 @@ def compare_all_and_return_models(
                     sinkhorn_iters=sinkhorn_iters,
                     drift_impl=drift_impl,
                     plan_float64=plan_float64,
+                    dist_metric=dist_metric,
                     eval_every=eval_every,
                     eval_n=eval_n,
                     eval_warmup_steps=eval_warmup_steps,
@@ -1300,6 +1320,15 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Use float64 for plain-space plan computations (one-/two-sided and sinkhorn).",
     )
     parser.add_argument(
+        "--dist-metric",
+        "--dist_metric",
+        dest="dist_metric",
+        type=str,
+        choices=("l2_sq", "l2"),
+        default="l2_sq",
+        help='Distance metric: "l2_sq" for ||x-y||^2 (Gaussian kernel), "l2" for ||x-y|| (Laplacian kernel). Default: l2_sq.',
+    )
+    parser.add_argument(
         "--out-root",
         dest="out_root",
         type=str,
@@ -1393,6 +1422,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         out_init_std=args.out_init_std,
         drift_impl=args.drift_impl,
         plan_float64=args.plan_float64,
+        dist_metric=args.dist_metric,
         return_logs=True,
     )
 
