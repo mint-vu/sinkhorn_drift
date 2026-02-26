@@ -478,10 +478,4 @@ Impact by feature encoder:
 | MoCo-v2 | varies per scale | moderate | moderate | Degraded but may train |
 | RAE | 196,608 | 3,932 | 8.86 | **NaN** (coupling &rarr; uniform &rarr; zero drift &rarr; AMP overflow) |
 
-**Status**: Fixed in this codebase. The collaborator's branch (`sinkhorn_rae`) still has this bug at `drifting_loss.py:564`.
-
-## References
-
-- K. He et al., *Generative Modeling via Drifting*, 2025.
-- X. Chen et al., *Improved Baselines with Momentum Contrastive Learning* (MoCo-v2), 2020.
-- M. Oquab et al., *DINOv2: Learning Robust Visual Features without Supervision*, 2023.
+**Status**: Fixed in this codebase. 
