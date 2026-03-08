@@ -1,0 +1,19 @@
+{
+  "run_name": "mnist_sinkhorn_tau0p03",
+  "gen_ckpt": "pretrained/mnist_laplacian/mnist_sinkhorn_tau0p03/ckpt_final.pt",
+  "omega": 1.0,
+  "n_per_class": 1000,
+  "per_class_acc": {
+    "0": 1.0,
+    "1": 1.0,
+    "2": 1.0,
+    "3": 1.0,
+    "4": 1.0,
+    "5": 1.0,
+    "6": 1.0,
+    "7": 1.0,
+    "8": 1.0,
+    "9": 1.0
+  },
+  "overall_acc": 1.0
+}

@@ -1,0 +1,19 @@
+{
+  "run_name": "mnist_baseline_tau0p01",
+  "gen_ckpt": "pretrained/mnist_laplacian/mnist_baseline_tau0p01/ckpt_final.pt",
+  "omega": 1.0,
+  "n_per_class": 1000,
+  "per_class_acc": {
+    "0": 0.0,
+    "1": 0.0,
+    "2": 0.0,
+    "3": 0.0,
+    "4": 0.0,
+    "5": 0.0,
+    "6": 0.0,
+    "7": 0.0,
+    "8": 1.0,
+    "9": 0.0
+  },
+  "overall_acc": 0.1
+}

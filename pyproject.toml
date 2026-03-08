@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=42"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sinkhorn-drifting"
+version = "0.1.0"
+requires-python = ">=3.8"
+dependencies = [
+    "torch",
+    "torchvision",
+    "numpy",
+    "matplotlib",
+    "POT",
+    "scikit-learn",
+    "Pillow",
+    "scipy",
+    "pytorch-fid",
+    "tqdm",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["core*", "mnist*", "toy*", "ffhq*"]
