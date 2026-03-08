@@ -1,9 +1,4 @@
-# Sinkhorn Drifting — Reproducibility Code
-
-Official code for the paper:
-**"[Paper Title]"**
-[Authors] — ECCV 2026
-
+# Sinkhorn-Drifting Generative Models
 ---
 
 ## Repository Structure
