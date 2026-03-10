@@ -1,7 +1,7 @@
 # Sinkhorn-Drifting Generative Models
 ---
 
-## Repository Structure
+## Codebase Structure
 
 ```
 sinkhorn_paper_code/
@@ -391,93 +391,6 @@ Pretrained checkpoints are included in `pretrained/`. The directory structure is
 pretrained/
 ├── ae/
 │   └── ae_final.pt                   # Autoencoder (latent_dim=6, trained 50 epochs)
-├── mnist_gaussian/                   # Table 1 — Gaussian kernel (dist_metric=l2_sq)
-│   ├── mnist_baseline_tau0p005_l2sq/ckpt_final.pt
-│   ├── mnist_sinkhorn_tau0p005_l2sq/ckpt_final.pt
-│   ├── mnist_baseline_tau0p01_l2sq/ckpt_final.pt
-│   ├── mnist_sinkhorn_tau0p01_l2sq/ckpt_final.pt
-│   ├── mnist_baseline_tau0p02_l2sq/ckpt_final.pt
-│   ├── mnist_sinkhorn_tau0p02_l2sq/ckpt_final.pt
-│   ├── mnist_baseline_tau0p025_l2sq/ckpt_final.pt
-│   ├── mnist_sinkhorn_tau0p025_l2sq/ckpt_final.pt
-│   ├── mnist_baseline_tau0p03_l2sq/ckpt_final.pt
-│   ├── mnist_sinkhorn_tau0p03_l2sq/ckpt_final.pt
-│   ├── mnist_baseline_tau0p04_l2sq/ckpt_final.pt
-│   ├── mnist_sinkhorn_tau0p04_l2sq/ckpt_final.pt
-│   ├── mnist_baseline_tau0p05_l2sq/ckpt_final.pt
-│   ├── mnist_sinkhorn_tau0p05_l2sq/ckpt_final.pt
-│   ├── mnist_baseline_tau0p1_l2sq/ckpt_final.pt
-│   └── mnist_sinkhorn_tau0p1_l2sq/ckpt_final.pt
-└── mnist_laplacian/                  # Appendix Table 3 — Laplacian kernel (dist_metric=l2)
-    ├── mnist_baseline_tau0p005/ckpt_final.pt
-    ├── mnist_sinkhorn_tau0p005/ckpt_final.pt
-    ├── ... (same τ values as above)
-    ├── mnist_baseline_tau0p1/ckpt_final.pt
-    └── mnist_sinkhorn_tau0p1/ckpt_final.pt
-```
-
-### Checkpoint → Training Command Mapping
-
-Each checkpoint corresponds to one row of Table 1 / Table 3. The training command that
-produced it is the loop in Steps 3–5 above with the matching `--temps` and `--run-name`.
-
-**Table 1 (Gaussian kernel, `--dist-metric l2_sq`):**
-
-| τ | Method | Checkpoint | Training run-name |
-|---|--------|-----------|-------------------|
-| 0.005 | Baseline | `pretrained/mnist_gaussian/mnist_baseline_tau0p005_l2sq/` | `mnist_baseline_tau0p005_l2sq` |
-| 0.005 | Sinkhorn | `pretrained/mnist_gaussian/mnist_sinkhorn_tau0p005_l2sq/` | `mnist_sinkhorn_tau0p005_l2sq` |
-| 0.010 | Baseline | `pretrained/mnist_gaussian/mnist_baseline_tau0p01_l2sq/` | `mnist_baseline_tau0p01_l2sq` |
-| 0.010 | Sinkhorn | `pretrained/mnist_gaussian/mnist_sinkhorn_tau0p01_l2sq/` | `mnist_sinkhorn_tau0p01_l2sq` |
-| 0.020 | Baseline | `pretrained/mnist_gaussian/mnist_baseline_tau0p02_l2sq/` | `mnist_baseline_tau0p02_l2sq` |
-| 0.020 | Sinkhorn | `pretrained/mnist_gaussian/mnist_sinkhorn_tau0p02_l2sq/` | `mnist_sinkhorn_tau0p02_l2sq` |
-| 0.025 | Baseline | `pretrained/mnist_gaussian/mnist_baseline_tau0p025_l2sq/` | `mnist_baseline_tau0p025_l2sq` |
-| 0.025 | Sinkhorn | `pretrained/mnist_gaussian/mnist_sinkhorn_tau0p025_l2sq/` | `mnist_sinkhorn_tau0p025_l2sq` |
-| 0.030 | Baseline | `pretrained/mnist_gaussian/mnist_baseline_tau0p03_l2sq/` | `mnist_baseline_tau0p03_l2sq` |
-| 0.030 | Sinkhorn | `pretrained/mnist_gaussian/mnist_sinkhorn_tau0p03_l2sq/` | `mnist_sinkhorn_tau0p03_l2sq` |
-| 0.040 | Baseline | `pretrained/mnist_gaussian/mnist_baseline_tau0p04_l2sq/` | `mnist_baseline_tau0p04_l2sq` |
-| 0.040 | Sinkhorn | `pretrained/mnist_gaussian/mnist_sinkhorn_tau0p04_l2sq/` | `mnist_sinkhorn_tau0p04_l2sq` |
-| 0.050 | Baseline | `pretrained/mnist_gaussian/mnist_baseline_tau0p05_l2sq/` | `mnist_baseline_tau0p05_l2sq` |
-| 0.050 | Sinkhorn | `pretrained/mnist_gaussian/mnist_sinkhorn_tau0p05_l2sq/` | `mnist_sinkhorn_tau0p05_l2sq` |
-| 0.100 | Baseline | `pretrained/mnist_gaussian/mnist_baseline_tau0p1_l2sq/` | `mnist_baseline_tau0p1_l2sq` |
-| 0.100 | Sinkhorn | `pretrained/mnist_gaussian/mnist_sinkhorn_tau0p1_l2sq/` | `mnist_sinkhorn_tau0p1_l2sq` |
-
-**Appendix Table 3 (Laplacian kernel, `--dist-metric l2`):** same τ values, same structure,
-checkpoints in `pretrained/mnist_laplacian/mnist_{method}_{tau}/`.
-
-### Evaluate pretrained checkpoints directly
-
-```bash
-AE=pretrained/ae/ae_final.pt
-
-# Example: evaluate Table 1, τ=0.005
-python -m mnist.eval_emd \
-    --gen-ckpt pretrained/mnist_gaussian/mnist_baseline_tau0p005_l2sq/ckpt_final.pt \
-               pretrained/mnist_gaussian/mnist_sinkhorn_tau0p005_l2sq/ckpt_final.pt \
-    --ae-ckpt $AE --omega 1.0 --data-root ./data
-
-python -m mnist.eval_acc \
-    --gen-ckpt pretrained/mnist_gaussian/mnist_baseline_tau0p005_l2sq/ckpt_final.pt \
-    --ae-ckpt $AE --omega 1.0 --data-root ./data
-
-# Evaluate all Table 1 checkpoints
-for tau in tau0p005 tau0p01 tau0p02 tau0p025 tau0p03 tau0p04 tau0p05 tau0p1; do
-    for method in baseline sinkhorn; do
-        python -m mnist.eval_emd \
-            --gen-ckpt pretrained/mnist_gaussian/mnist_${method}_${tau}_l2sq/ckpt_final.pt \
-            --ae-ckpt $AE --omega 1.0 --data-root ./data
-        python -m mnist.eval_acc \
-            --gen-ckpt pretrained/mnist_gaussian/mnist_${method}_${tau}_l2sq/ckpt_final.pt \
-            --ae-ckpt $AE --omega 1.0 --data-root ./data
-    done
-done
-
-# Generate figures from pretrained checkpoints
-python -m mnist.make_figure \
-    --ae-ckpt $AE --run-root pretrained/mnist_gaussian \
-    --out figures/mnist_gaussian.pdf --kernel gaussian
-
-python -m mnist.make_figure \
-    --ae-ckpt $AE --run-root pretrained/mnist_laplacian \
-    --out figures/mnist_laplacian.pdf --kernel laplacian
+├── mnist_gaussian/                   # Table 1 — Gaussian kernel 
+└── mnist_laplacian/                  # Appendix Table 3 — Laplacian kernel
 ```
